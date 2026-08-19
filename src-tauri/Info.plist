@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Interview Copilot 需要捕获系统音频，以便在本机进行实时转写。</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Interview Copilot 需要使用麦克风，以便转写候选人的回答。</string>
+</dict>
+</plist>
+
