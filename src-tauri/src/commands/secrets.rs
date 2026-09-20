@@ -1,13 +1,42 @@
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 const KEYCHAIN_SERVICE: &str = "com.interviewcopilot.desktop";
 const KEYCHAIN_ITEM_NOT_FOUND: i32 = -25_300;
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum SecretKind {
     DeepseekApiKey,
     TencentSecretKey,
+}
+
+static SECRET_CACHE: OnceLock<Mutex<HashMap<SecretKind, String>>> = OnceLock::new();
+
+fn secret_cache() -> &'static Mutex<HashMap<SecretKind, String>> {
+    SECRET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_secret(kind: SecretKind) -> Result<Option<String>, String> {
+    secret_cache()
+        .lock()
+        .map(|cache| cache.get(&kind).cloned())
+        .map_err(|_| "密钥内存缓存状态异常".to_string())
+}
+
+fn cache_secret(kind: SecretKind, value: Option<&str>) -> Result<(), String> {
+    let mut cache = secret_cache()
+        .lock()
+        .map_err(|_| "密钥内存缓存状态异常".to_string())?;
+    if let Some(value) = value {
+        cache.insert(kind, value.to_string());
+    } else {
+        cache.remove(&kind);
+    }
+    Ok(())
 }
 
 impl SecretKind {
@@ -30,10 +59,17 @@ pub struct SecretStatus {
 pub(crate) fn load_secret(kind: SecretKind) -> Result<Option<String>, String> {
     use security_framework::passwords::get_generic_password;
 
+    if let Some(value) = cached_secret(kind)? {
+        return Ok(Some(value));
+    }
+
     match get_generic_password(KEYCHAIN_SERVICE, kind.account()) {
-        Ok(value) => String::from_utf8(value)
-            .map(Some)
-            .map_err(|_| "钥匙串中的密钥不是有效文本".to_string()),
+        Ok(value) => {
+            let value = String::from_utf8(value)
+                .map_err(|_| "钥匙串中的密钥不是有效文本".to_string())?;
+            cache_secret(kind, Some(&value))?;
+            Ok(Some(value))
+        }
         Err(error) if error.code() == KEYCHAIN_ITEM_NOT_FOUND => Ok(None),
         Err(error) => Err(format!("无法读取 macOS 钥匙串：{error}")),
     }
@@ -51,7 +87,8 @@ fn store_secret(kind: SecretKind, value: &str) -> Result<(), String> {
         kind.account(),
         value.as_bytes(),
     )
-    .map_err(|error| format!("无法写入 macOS 钥匙串：{error}"))
+    .map_err(|error| format!("无法写入 macOS 钥匙串：{error}"))?;
+    cache_secret(kind, Some(value))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -61,14 +98,16 @@ fn store_secret(_kind: SecretKind, _value: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 fn remove_secret(kind: SecretKind) -> Result<(), String> {
-    match security_framework::passwords::delete_generic_password(
+    let result = match security_framework::passwords::delete_generic_password(
         KEYCHAIN_SERVICE,
         kind.account(),
     ) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == KEYCHAIN_ITEM_NOT_FOUND => Ok(()),
         Err(error) => Err(format!("无法从 macOS 钥匙串删除密钥：{error}")),
-    }
+    };
+    result?;
+    cache_secret(kind, None)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -76,11 +115,36 @@ fn remove_secret(_kind: SecretKind) -> Result<(), String> {
     Err("当前版本仅支持使用 macOS 钥匙串保存密钥".to_string())
 }
 
+#[cfg(target_os = "macos")]
+fn secret_exists(kind: SecretKind) -> Result<bool, String> {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+
+    let mut search = ItemSearchOptions::new();
+    search
+        .class(ItemClass::generic_password())
+        .service(KEYCHAIN_SERVICE)
+        .account(kind.account())
+        .load_attributes(true)
+        // Status checks must never show an authentication dialog. Secret data
+        // is requested only when a provider actually needs it.
+        .skip_authenticated_items(true);
+    match search.search() {
+        Ok(items) => Ok(!items.is_empty()),
+        Err(error) if error.code() == KEYCHAIN_ITEM_NOT_FOUND => Ok(false),
+        Err(error) => Err(format!("无法检查 macOS 钥匙串状态：{error}")),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn secret_exists(_kind: SecretKind) -> Result<bool, String> {
+    Err("当前版本仅支持使用 macOS 钥匙串保存密钥".to_string())
+}
+
 #[tauri::command]
 pub fn get_secret_status() -> Result<SecretStatus, String> {
     Ok(SecretStatus {
-        deepseek_api_key: load_secret(SecretKind::DeepseekApiKey)?.is_some(),
-        tencent_secret_key: load_secret(SecretKind::TencentSecretKey)?.is_some(),
+        deepseek_api_key: secret_exists(SecretKind::DeepseekApiKey)?,
+        tencent_secret_key: secret_exists(SecretKind::TencentSecretKey)?,
     })
 }
 

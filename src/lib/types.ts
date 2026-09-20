@@ -16,6 +16,18 @@ export interface TranscriptEntry {
   language: DetectedLanguage;
   timestamp: number;
   isFinal: boolean;
+  translation?: string;
+  translationStatus?: "pending" | "complete" | "error";
+  translationError?: string;
+  translationKey?: string;
+}
+
+export type TranslationMode = "off" | "deepseek" | "ollama";
+
+export interface TranslationConfig {
+  mode: TranslationMode;
+  ollamaBaseUrl: string;
+  ollamaModel: string;
 }
 
 export interface ProviderConfig {
@@ -50,6 +62,7 @@ export interface AudioLevelEvent {
   rms: number;
   peak: number;
   sampleRate: number;
+  speaker: "interviewer" | "candidate";
 }
 
 export interface TranscriptFinalEvent {

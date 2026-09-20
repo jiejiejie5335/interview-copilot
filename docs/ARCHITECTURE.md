@@ -3,25 +3,32 @@
 ## Current MVP
 
 ```text
-macOS system audio
-  -> Swift Core Audio Process Tap helper
-  -> mono Float32 PCM
-  -> Rust 16 kHz resampler + energy VAD
-  -> whisper.cpp multilingual small (language=auto)
-  -> transcript-final Tauri event
-  -> zh / en / mixed question detector
-  -> interview prompt builder
-  -> Rust OpenAI-compatible provider
-  -> DeepSeek SSE stream
-  -> Tauri llm-stream event
-  -> React answer coach
+macOS system audio -> Core Audio Process Tap -> interviewer PCM -> interviewer STT
+default microphone -> AVAudioEngine input tap -> candidate PCM -> candidate STT
+                                                       |
+                                                       v
+                                   timestamped role-aware transcript
+                                                       |
+                         interviewer question detector + recent dialogue context
+                                                       |
+                              Rust OpenAI-compatible provider -> DeepSeek SSE
+                                                       |
+                                              React answer coach
+
+final interviewer English/mixed transcript
+  -> translation switch
+     -> DeepSeek non-streaming chat completion
+     -> Ollama local /api/chat
+  -> Chinese reference shown below the preserved source text
 ```
 
-Audio levels are calculated from the same PCM stream and emitted separately for the React meter. The API key crosses the Tauri IPC boundary for a single request and is held in memory only. Network requests originate in Rust, so the webview does not need broad outbound CSP access.
+The two mono Float32 PCM streams have independent queues, recognizers and level events. This preserves speaker attribution during brief overlap. Only interviewer text becomes the latest question; final interviewer and candidate turns are both included in the prompt so follow-up questions can be interpreted using the candidate's previous answer. Sensitive provider credentials are loaded from macOS Keychain only when needed. Network requests originate in Rust, so the webview does not need broad outbound CSP access.
+
+Translation is deliberately separate from answer generation. Each finalized English or mixed interviewer entry has its own non-streaming translation request and status, so translation completion or failure cannot overwrite an active answer stream. DeepSeek reuses the configured provider and Keychain credential; Ollama uses its native local `POST /api/chat` endpoint.
 
 ## STT boundary
 
-The audio helper emits raw PCM while Rust creates utterance-sized 16 kHz segments. The current transcription service uses this conceptual provider boundary:
+The audio helper emits raw PCM. Each source is routed to the selected provider with a fixed role:
 
 ```text
 trait Transcriber
@@ -31,13 +38,14 @@ trait Transcriber
 Routing policy:
 
 - `auto` is always the UI default; users do not need to choose Chinese or English in advance.
-- Current engine: whisper.cpp multilingual small with automatic language detection.
-- Planned Chinese accuracy option: sherpa-onnx/FunASR.
+- Local fast engine: streaming bilingual Zipformer plus SenseVoice final refinement.
+- Local accurate engine: streaming bilingual Zipformer plus Qwen3-ASR final refinement.
+- Cloud engine: two Tencent ASR V2 WebSocket sessions using `16k_zh_en_2.0`.
 - Final transcripts pass through the existing `zh | en | mixed | unknown` detector.
 
 ## Planned boundaries
 
-- `Transcriber`: current whisper.cpp worker; sherpa-onnx/FunASR later.
+- `Transcriber`: current sherpa-onnx local workers and Tencent cloud worker.
 - `Retriever`: resume/JD chunks with local embeddings and citations.
 - `ChatProvider`: current OpenAI-compatible implementation plus Ollama.
-- `AudioCapture`: current macOS Process Tap; Windows WASAPI Loopback later.
+- `AudioCapture`: current macOS Process Tap + AVAudioEngine microphone; Windows WASAPI Loopback later.

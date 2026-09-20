@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { detectQuestion } from "./lib/questionDetector";
 import { startChatStream } from "./lib/provider";
 import { buildInterviewMessages } from "./lib/prompts";
+import { translateToChinese } from "./lib/translation";
 import type {
   AnswerLanguage,
   AudioLevelEvent,
@@ -14,6 +15,7 @@ import type {
   TranscriptEntry,
   TranscriptFinalEvent,
   TranscriptPartialEvent,
+  TranslationConfig,
 } from "./lib/types";
 
 const DEFAULT_PROVIDER: ProviderConfig = {
@@ -45,6 +47,12 @@ const DEFAULT_STT_CONFIG: SttConfig = {
   },
 };
 
+const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
+  mode: "off",
+  ollamaBaseUrl: "http://127.0.0.1:11434",
+  ollamaModel: "qwen2.5:3b",
+};
+
 interface SecretStatus {
   deepseekApiKey: boolean;
   tencentSecretKey: boolean;
@@ -66,6 +74,7 @@ interface PublicPreferences {
     hotwords?: string;
     tencent?: Partial<Omit<SttConfig["tencent"], "secretKey">>;
   };
+  translation?: Partial<TranslationConfig>;
 }
 
 function loadPublicPreferences(): PublicPreferences {
@@ -105,7 +114,30 @@ function loadSttPreferences(): SttConfig {
   };
 }
 
-function savePublicPreferences(provider: ProviderConfig, sttConfig: SttConfig) {
+function loadTranslationPreferences(): TranslationConfig {
+  const saved = loadPublicPreferences().translation;
+  const validModes: TranslationConfig["mode"][] = ["off", "deepseek", "ollama"];
+  return {
+    mode:
+      saved?.mode && validModes.includes(saved.mode)
+        ? saved.mode
+        : DEFAULT_TRANSLATION_CONFIG.mode,
+    ollamaBaseUrl:
+      typeof saved?.ollamaBaseUrl === "string"
+        ? saved.ollamaBaseUrl
+        : DEFAULT_TRANSLATION_CONFIG.ollamaBaseUrl,
+    ollamaModel:
+      typeof saved?.ollamaModel === "string"
+        ? saved.ollamaModel
+        : DEFAULT_TRANSLATION_CONFIG.ollamaModel,
+  };
+}
+
+function savePublicPreferences(
+  provider: ProviderConfig,
+  sttConfig: SttConfig,
+  translation: TranslationConfig,
+) {
   const preferences: PublicPreferences = {
     provider: {
       name: provider.name,
@@ -121,6 +153,7 @@ function savePublicPreferences(provider: ProviderConfig, sttConfig: SttConfig) {
         secretId: sttConfig.tencent.secretId,
       },
     },
+    translation,
   };
   localStorage.setItem(APP_PREFERENCES_KEY, JSON.stringify(preferences));
 }
@@ -167,14 +200,19 @@ function saveWindowPreferences(preferences: WindowPreferences) {
 
 function App() {
   const [listening, setListening] = useState(false);
-  const [audioLevel, setAudioLevel] = useState<AudioLevelEvent>({
-    rms: 0,
-    peak: 0,
-    sampleRate: 0,
+  const [audioLevels, setAudioLevels] = useState<
+    Record<TranscriptEntry["speaker"], AudioLevelEvent>
+  >({
+    interviewer: { rms: 0, peak: 0, sampleRate: 0, speaker: "interviewer" },
+    candidate: { rms: 0, peak: 0, sampleRate: 0, speaker: "candidate" },
   });
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [partialTranscript, setPartialTranscript] = useState<TranscriptEntry | null>(null);
+  const [partialTranscripts, setPartialTranscripts] = useState<
+    Partial<Record<TranscriptEntry["speaker"], TranscriptEntry>>
+  >({});
   const deletedTranscriptIdsRef = useRef(new Set<string>());
+  const transcriptStartTimesRef = useRef(new Map<string, number>());
+  const translationRequestsRef = useRef(new Set<string>());
   const [draft, setDraft] = useState("");
   const [speaker, setSpeaker] = useState<"interviewer" | "candidate">("interviewer");
   const [provider, setProvider] = useState(loadProviderPreferences);
@@ -188,6 +226,7 @@ function App() {
   const [profile, setProfile] = useState("");
   const [jobDescription, setJobDescription] = useState("");
   const [sttConfig, setSttConfig] = useState(loadSttPreferences);
+  const [translationConfig, setTranslationConfig] = useState(loadTranslationPreferences);
   const [showSettings, setShowSettings] = useState(false);
   const [windowPreferences, setWindowPreferences] = useState(loadWindowPreferences);
 
@@ -195,14 +234,28 @@ function App() {
     () => [...transcript].reverse().find((entry) => entry.speaker === "interviewer"),
     [transcript],
   );
+  const partialEntries = useMemo(
+    () =>
+      Object.values(partialTranscripts).sort(
+        (left, right) => left.timestamp - right.timestamp,
+      ),
+    [partialTranscripts],
+  );
+  const interviewerPartial = partialTranscripts.interviewer;
   const detection = useMemo(
-    () => detectQuestion(partialTranscript?.text ?? latestInterviewer?.text ?? draft),
-    [draft, latestInterviewer, partialTranscript],
+    () =>
+      detectQuestion(
+        interviewerPartial?.text ??
+          latestInterviewer?.text ??
+          (speaker === "interviewer" ? draft : ""),
+      ),
+    [draft, interviewerPartial, latestInterviewer, speaker],
   );
 
   useEffect(() => {
     const unlistenLevel = listen<AudioLevelEvent>("audio-level", (event) => {
-      setAudioLevel(event.payload);
+      const payload = event.payload;
+      setAudioLevels((current) => ({ ...current, [payload.speaker]: payload }));
     });
     const unlistenLlm = listen<LlmStreamEvent>("llm-stream", (event) => {
       const payload = event.payload;
@@ -228,15 +281,24 @@ function App() {
       const payload = event.payload;
       if (deletedTranscriptIdsRef.current.has(payload.id)) return;
       const result = detectQuestion(payload.text);
-      setPartialTranscript({
-        id: payload.id,
-        speaker: payload.speaker,
-        text: payload.text,
-        language: result.language,
-        timestamp: Date.now(),
-        isFinal: false,
-      });
-      setStatus("正在实时识别…");
+      const timestamp = transcriptStartTimesRef.current.get(payload.id) ?? Date.now();
+      transcriptStartTimesRef.current.set(payload.id, timestamp);
+      setPartialTranscripts((current) => ({
+        ...current,
+        [payload.speaker]: {
+          id: payload.id,
+          speaker: payload.speaker,
+          text: payload.text,
+          language: result.language,
+          timestamp,
+          isFinal: false,
+        },
+      }));
+      setStatus(
+        payload.speaker === "interviewer"
+          ? "正在识别面试官…"
+          : "正在记录我的回答…",
+      );
     });
     const unlistenTranscript = listen<TranscriptFinalEvent>("transcript-final", (event) => {
       const payload = event.payload;
@@ -247,16 +309,31 @@ function App() {
         speaker: payload.speaker,
         text: payload.text,
         language: result.language,
-        timestamp: Date.now(),
+        timestamp: transcriptStartTimesRef.current.get(payload.id) ?? Date.now(),
         isFinal: payload.isFinal,
       };
-      setPartialTranscript((current) => (current?.id === payload.id ? null : current));
+      transcriptStartTimesRef.current.delete(payload.id);
+      setPartialTranscripts((current) => {
+        if (current[payload.speaker]?.id !== payload.id) return current;
+        const next = { ...current };
+        delete next[payload.speaker];
+        return next;
+      });
       setTranscript((current) => {
         const existingIndex = current.findIndex((item) => item.id === payload.id);
-        if (existingIndex < 0) return [...current, entry];
-        return current.map((item, index) => (index === existingIndex ? entry : item));
+        const next =
+          existingIndex < 0
+            ? [...current, entry]
+            : current.map((item, index) => (index === existingIndex ? entry : item));
+        return next.sort((left, right) => left.timestamp - right.timestamp);
       });
-      setStatus(result.isQuestion ? "已识别面试问题" : "已完成一段语音识别");
+      setStatus(
+        payload.speaker === "candidate"
+          ? "已记录我的回答"
+          : result.isQuestion
+            ? "已识别面试问题"
+            : "已完成一段面试官语音识别",
+      );
     });
     const unlistenSttStatus = listen<SttStatusEvent>("stt-status", (event) => {
       setStatus(event.payload.message);
@@ -279,7 +356,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    savePublicPreferences(provider, sttConfig);
+    savePublicPreferences(provider, sttConfig, translationConfig);
   }, [
     provider.baseUrl,
     provider.disableThinking,
@@ -289,6 +366,99 @@ function App() {
     sttConfig.mode,
     sttConfig.tencent.appId,
     sttConfig.tencent.secretId,
+    translationConfig.mode,
+    translationConfig.ollamaBaseUrl,
+    translationConfig.ollamaModel,
+  ]);
+
+  useEffect(() => {
+    if (translationConfig.mode === "off") return;
+    if (
+      translationConfig.mode === "deepseek" &&
+      !provider.apiKey.trim() &&
+      !secretStatus.deepseekApiKey
+    ) {
+      return;
+    }
+    if (
+      translationConfig.mode === "ollama" &&
+      (!translationConfig.ollamaBaseUrl.trim() || !translationConfig.ollamaModel.trim())
+    ) {
+      return;
+    }
+
+    for (const entry of transcript) {
+      if (
+        entry.speaker !== "interviewer" ||
+        !entry.isFinal ||
+        !["en", "mixed"].includes(entry.language) ||
+        !entry.text.trim()
+      ) {
+        continue;
+      }
+      const engine =
+        translationConfig.mode === "deepseek"
+          ? `${provider.baseUrl}|${provider.model}`
+          : `${translationConfig.ollamaBaseUrl}|${translationConfig.ollamaModel}`;
+      const translationKey = `${entry.id}|${translationConfig.mode}|${engine}|${entry.text}`;
+      if (
+        translationRequestsRef.current.has(translationKey) ||
+        (entry.translationKey === translationKey && entry.translationStatus === "complete")
+      ) {
+        continue;
+      }
+
+      translationRequestsRef.current.add(translationKey);
+      setTranscript((current) =>
+        current.map((item) =>
+          item.id === entry.id
+            ? {
+                ...item,
+                translation: undefined,
+                translationError: undefined,
+                translationKey,
+                translationStatus: "pending",
+              }
+            : item,
+        ),
+      );
+      void translateToChinese(entry.text, translationConfig, provider)
+        .then((translation) => {
+          setTranscript((current) =>
+            current.map((item) =>
+              item.id === entry.id && item.translationKey === translationKey
+                ? {
+                    ...item,
+                    translation,
+                    translationError: undefined,
+                    translationStatus: "complete",
+                  }
+                : item,
+            ),
+          );
+        })
+        .catch((error) => {
+          setTranscript((current) =>
+            current.map((item) =>
+              item.id === entry.id && item.translationKey === translationKey
+                ? {
+                    ...item,
+                    translationError: String(error),
+                    translationStatus: "error",
+                  }
+                : item,
+            ),
+          );
+        });
+    }
+  }, [
+    provider.apiKey,
+    provider.baseUrl,
+    provider.disableThinking,
+    provider.model,
+    secretStatus.deepseekApiKey,
+    transcript,
+    translationConfig,
   ]);
 
   useEffect(() => {
@@ -326,7 +496,7 @@ function App() {
         }
         await invoke("start_audio_capture", { config: sttConfig });
         setListening(true);
-        setStatus("正在监听并识别系统音频");
+        setStatus("正在监听面试官和我的麦克风");
       }
     } catch (error) {
       setStatus(`音频错误：${String(error)}`);
@@ -354,9 +524,33 @@ function App() {
 
   function deleteTranscript(id: string) {
     deletedTranscriptIdsRef.current.add(id);
+    transcriptStartTimesRef.current.delete(id);
     setTranscript((current) => current.filter((entry) => entry.id !== id));
-    setPartialTranscript((current) => (current?.id === id ? null : current));
+    setPartialTranscripts((current) => {
+      const next = { ...current };
+      for (const entry of Object.values(next)) {
+        if (entry?.id === id) delete next[entry.speaker];
+      }
+      return next;
+    });
     setStatus("已删除这条转写");
+  }
+
+  function retryTranslation(entry: TranscriptEntry) {
+    if (entry.translationKey) {
+      translationRequestsRef.current.delete(entry.translationKey);
+    }
+    setTranscript((current) =>
+      current.map((item) =>
+        item.id === entry.id
+          ? {
+              ...item,
+              translationError: undefined,
+              translationStatus: undefined,
+            }
+          : item,
+      ),
+    );
   }
 
   function clearTranscript() {
@@ -364,10 +558,14 @@ function App() {
       current.forEach((entry) => deletedTranscriptIdsRef.current.add(entry.id));
       return [];
     });
-    setPartialTranscript((current) => {
-      if (current) deletedTranscriptIdsRef.current.add(current.id);
-      return null;
+    setPartialTranscripts((current) => {
+      Object.values(current).forEach((entry) => {
+        if (entry) deletedTranscriptIdsRef.current.add(entry.id);
+      });
+      return {};
     });
+    transcriptStartTimesRef.current.clear();
+    translationRequestsRef.current.clear();
     setStatus("转写记录已清空");
   }
 
@@ -432,7 +630,9 @@ function App() {
 
   async function askAi() {
     const question =
-      partialTranscript?.text.trim() || latestInterviewer?.text.trim() || draft.trim();
+      interviewerPartial?.text.trim() ||
+      latestInterviewer?.text.trim() ||
+      (speaker === "interviewer" ? draft.trim() : "");
     if (!question) {
       setStatus("请先加入一条面试官转写");
       return;
@@ -475,7 +675,10 @@ function App() {
     }
   }
 
-  const meterWidth = `${Math.min(100, Math.max(2, audioLevel.rms * 260))}%`;
+  const meterWidths = {
+    interviewer: `${Math.min(100, Math.max(2, audioLevels.interviewer.rms * 260))}%`,
+    candidate: `${Math.min(100, Math.max(2, audioLevels.candidate.rms * 260))}%`,
+  };
 
   return (
     <main className={`app-shell ${windowPreferences.alwaysOnTop ? "focus-mode" : ""}`}>
@@ -614,6 +817,80 @@ function App() {
               关闭思考模式以降低延迟
             </label>
           </div>
+          <div className="translation-settings">
+            <label className="check-field translation-toggle">
+              <input
+                type="checkbox"
+                checked={translationConfig.mode !== "off"}
+                onChange={(event) =>
+                  setTranslationConfig({
+                    ...translationConfig,
+                    mode: event.target.checked ? "deepseek" : "off",
+                  })
+                }
+              />
+              开启英语面试实时中文翻译
+            </label>
+            {translationConfig.mode !== "off" && (
+              <>
+                <label>
+                  翻译方式
+                  <select
+                    value={translationConfig.mode}
+                    onChange={(event) =>
+                      setTranslationConfig({
+                        ...translationConfig,
+                        mode: event.target.value as Exclude<
+                          TranslationConfig["mode"],
+                          "off"
+                        >,
+                      })
+                    }
+                  >
+                    <option value="deepseek">DeepSeek 云端翻译</option>
+                    <option value="ollama">Ollama 本地翻译</option>
+                  </select>
+                </label>
+                {translationConfig.mode === "deepseek" ? (
+                  <p className="translation-note">
+                    使用上方同一个 DeepSeek 模型和 API Key，仅发送面试官的英文转写文本，不发送音频。
+                  </p>
+                ) : (
+                  <>
+                    <label>
+                      Ollama 地址
+                      <input
+                        value={translationConfig.ollamaBaseUrl}
+                        placeholder="http://127.0.0.1:11434"
+                        onChange={(event) =>
+                          setTranslationConfig({
+                            ...translationConfig,
+                            ollamaBaseUrl: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <label>
+                      Ollama 模型
+                      <input
+                        value={translationConfig.ollamaModel}
+                        placeholder="qwen2.5:3b"
+                        onChange={(event) =>
+                          setTranslationConfig({
+                            ...translationConfig,
+                            ollamaModel: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                    <p className="translation-note">
+                      完全在本机翻译。首次使用前运行：ollama pull {translationConfig.ollamaModel || "qwen2.5:3b"}
+                    </p>
+                  </>
+                )}
+              </>
+            )}
+          </div>
           {sttConfig.mode === "tencentCloud" && (
             <div className="settings-grid cloud-settings">
               <label>
@@ -724,7 +1001,7 @@ function App() {
             <div className="panel-actions">
               <button
                 className="clear-button"
-                disabled={transcript.length === 0 && !partialTranscript}
+                disabled={transcript.length === 0 && partialEntries.length === 0}
                 onClick={clearTranscript}
               >
                 清空
@@ -738,26 +1015,70 @@ function App() {
             </div>
           </div>
 
-          <div className="audio-meter" aria-label="Audio input level">
-            <span style={{ width: meterWidth }} />
+          <div className="audio-sources">
+            <div className="audio-source">
+              <div>
+                <strong>面试官 · 系统声音</strong>
+                <small>
+                  {audioLevels.interviewer.sampleRate
+                    ? `${audioLevels.interviewer.sampleRate} Hz · peak ${audioLevels.interviewer.peak.toFixed(2)}`
+                    : "等待 Core Audio Tap"}
+                </small>
+              </div>
+              <div className="audio-meter" aria-label="系统音频电平">
+                <span style={{ width: meterWidths.interviewer }} />
+              </div>
+            </div>
+            <div className="audio-source candidate-source">
+              <div>
+                <strong>我 · 麦克风</strong>
+                <small>
+                  {audioLevels.candidate.sampleRate
+                    ? `${audioLevels.candidate.sampleRate} Hz · peak ${audioLevels.candidate.peak.toFixed(2)}`
+                    : "等待麦克风权限"}
+                </small>
+              </div>
+              <div className="audio-meter" aria-label="麦克风输入电平">
+                <span style={{ width: meterWidths.candidate }} />
+              </div>
+            </div>
           </div>
-          <p className="meter-caption">
-            {audioLevel.sampleRate
-              ? `${audioLevel.sampleRate} Hz · peak ${audioLevel.peak.toFixed(2)}`
-              : "等待 Core Audio Tap"}
-          </p>
 
           <div className="transcript-list">
-            {transcript.length === 0 && !partialTranscript ? (
+            {transcript.length === 0 && partialEntries.length === 0 ? (
               <div className="empty-state">
-                <p>播放面试录音后，识别结果会边说边出现，短暂停顿后自动定稿。也可以手动输入进行修正。</p>
+                <p>系统声音会标记为“面试官”，麦克风会标记为“我”。建议佩戴耳机，避免扬声器声音再次进入麦克风。</p>
               </div>
             ) : (
               <>
                 {transcript.map((entry) => (
                   <div className={`transcript-row ${entry.speaker}`} key={entry.id}>
                     <span>{entry.speaker === "interviewer" ? "面试官" : "我"}</span>
-                    <p>{entry.text}</p>
+                    <div className="transcript-copy">
+                      <p>{entry.text}</p>
+                      {translationConfig.mode !== "off" &&
+                        entry.speaker === "interviewer" &&
+                        ["en", "mixed"].includes(entry.language) && (
+                          <div className={`translation ${entry.translationStatus ?? ""}`}>
+                            {entry.translationStatus === "pending" && <small>正在翻译为中文…</small>}
+                            {entry.translationStatus === "complete" && entry.translation && (
+                              <p>{entry.translation}</p>
+                            )}
+                            {entry.translationStatus === "error" && (
+                              <div className="translation-error">
+                                <small>{entry.translationError}</small>
+                                <button onClick={() => retryTranslation(entry)}>重试</button>
+                              </div>
+                            )}
+                            {!entry.translationStatus &&
+                              translationConfig.mode === "deepseek" &&
+                              !provider.apiKey.trim() &&
+                              !secretStatus.deepseekApiKey && (
+                                <small>保存 DeepSeek API Key 后自动翻译</small>
+                              )}
+                          </div>
+                        )}
+                    </div>
                     <small>{entry.language}</small>
                     <button
                       className="row-delete-button"
@@ -769,7 +1090,7 @@ function App() {
                     </button>
                   </div>
                 ))}
-                {partialTranscript && (
+                {partialEntries.map((partialTranscript) => (
                   <div
                     className={`transcript-row ${partialTranscript.speaker} partial`}
                     key={partialTranscript.id}
@@ -786,7 +1107,7 @@ function App() {
                       删除
                     </button>
                   </div>
-                )}
+                ))}
               </>
             )}
           </div>

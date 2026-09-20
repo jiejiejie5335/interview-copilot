@@ -281,6 +281,29 @@ textarea {
   background: rgba(32, 74, 112, 0.08);
 }
 
+.translation-settings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(103, 94, 190, 0.24);
+  border-radius: 11px;
+  background: rgba(74, 62, 139, 0.08);
+}
+
+.translation-toggle,
+.translation-note {
+  grid-column: 1 / -1;
+}
+
+.translation-note {
+  align-self: end;
+  color: #738193;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
 .workspace-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
@@ -346,9 +369,38 @@ textarea {
   opacity: 0.58;
 }
 
+.audio-sources {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 14px 18px 0;
+}
+
+.audio-source {
+  display: grid;
+  gap: 7px;
+}
+
+.audio-source > div:first-child {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.audio-source strong {
+  color: #8d9aaa;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.audio-source small {
+  color: #657181;
+  font-size: 9px;
+}
+
 .audio-meter {
   height: 3px;
-  margin: 14px 18px 0;
   overflow: hidden;
   border-radius: 999px;
   background: #1a222c;
@@ -362,8 +414,8 @@ textarea {
   transition: width 80ms linear;
 }
 
-.meter-caption {
-  padding: 7px 18px 0;
+.candidate-source .audio-meter span {
+  background: linear-gradient(90deg, #4f74d8, #ad7ee8);
 }
 
 .transcript-list {
@@ -425,6 +477,48 @@ textarea {
 .transcript-row p {
   font-size: 13px;
   line-height: 1.6;
+}
+
+.transcript-copy {
+  min-width: 0;
+}
+
+.translation {
+  margin-top: 8px;
+  padding: 7px 9px;
+  border-left: 2px solid rgba(126, 102, 221, 0.58);
+  border-radius: 0 7px 7px 0;
+  background: rgba(87, 67, 151, 0.1);
+}
+
+.translation p {
+  color: #c9c1ee;
+  font-size: 12px;
+}
+
+.translation.pending small {
+  color: #9286c5;
+}
+
+.translation-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.translation-error small {
+  color: #d48e8e;
+  line-height: 1.5;
+}
+
+.translation-error button {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-color: rgba(212, 142, 142, 0.35);
+  color: #d8a0a0;
+  background: transparent;
+  font-size: 9px;
 }
 
 .transcript-row.partial {
@@ -587,7 +681,7 @@ textarea {
   border-color: transparent;
 }
 
-.focus-mode .audio-meter {
+.focus-mode .audio-sources {
   visibility: hidden;
 }
 

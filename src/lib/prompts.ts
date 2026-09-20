@@ -1,5 +1,29 @@
 import type { AnswerLanguage, ChatMessage, TranscriptEntry } from "./types";
 
+function buildRecentConversation(transcript: TranscriptEntry[]): string {
+  const turns: Array<{ speaker: TranscriptEntry["speaker"]; text: string }> = [];
+  for (const entry of [...transcript]
+    .filter((item) => item.isFinal && item.text.trim())
+    .sort((left, right) => left.timestamp - right.timestamp)) {
+    const text = entry.text.trim();
+    const previous = turns.at(-1);
+    if (previous?.speaker === entry.speaker) {
+      previous.text = `${previous.text} ${text}`;
+    } else {
+      turns.push({ speaker: entry.speaker, text });
+    }
+  }
+
+  return turns
+    .slice(-10)
+    .map(
+      (turn) =>
+        `${turn.speaker === "interviewer" ? "Interviewer" : "Candidate"}: ${turn.text}`,
+    )
+    .join("\n")
+    .slice(-6_000);
+}
+
 function languageInstruction(language: AnswerLanguage): string {
   if (language === "en") {
     return "The candidate explicitly selected English. You MUST answer entirely in natural spoken English, even when the question or hints are in Chinese.";
@@ -15,18 +39,13 @@ export function buildInterviewMessages(
   jobDescription = "",
   answerHints = "",
 ): ChatMessage[] {
-  const recentContext = transcript
-    .slice(-8)
-    .map(
-      (entry) =>
-        `${entry.speaker === "interviewer" ? "Interviewer" : "Candidate"}: ${entry.text}`,
-    )
-    .join("\n");
+  const recentContext = buildRecentConversation(transcript);
 
   const system = [
     "You are a real-time technical interview coach.",
     "The transcript comes from streaming ASR and may contain homophones, split words, or wrong technical terms.",
     "Infer the intended interview question from the recent context before answering. Correct likely ASR errors silently only when context supports the correction.",
+    "Use the candidate's preceding answer to interpret follow-up questions, but never assume that ASR text is a verified fact beyond what the candidate actually said.",
     "If an important phrase remains ambiguous, make the smallest reasonable assumption and give an answer that remains useful under either interpretation.",
     "Produce a concise answer outline the candidate can adapt truthfully.",
     "Do not invent projects, employers, metrics, or experience.",

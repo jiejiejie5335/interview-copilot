@@ -19,18 +19,24 @@ struct StreamHeader {
     format: String,
 }
 
-/// Runs the native Core Audio helper. The helper writes one JSON header line,
-/// followed by raw mono Float32 little-endian PCM until it is stopped.
-pub async fn run_pcm_stream<F>(stop: Arc<AtomicBool>, mut on_samples: F) -> Result<()>
+async fn run_helper_stream<F>(
+    mode: Option<&str>,
+    stop: Arc<AtomicBool>,
+    mut on_samples: F,
+) -> Result<()>
 where
     F: FnMut(&[f32], u32) + Send + 'static,
 {
-    let mut child = Command::new(env!("INTERVIEW_AUDIO_TAP_BIN"))
+    let mut command = Command::new(env!("INTERVIEW_AUDIO_TAP_BIN"));
+    if let Some(mode) = mode {
+        command.arg(mode);
+    }
+    let mut child = command
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .context("无法启动 Core Audio Tap helper")?;
+        .context("无法启动 macOS 音频 helper")?;
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("无法读取音频 helper 输出"))?;
     let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("无法读取音频 helper 错误输出"))?;
     let mut reader = BufReader::new(stdout);
@@ -87,3 +93,18 @@ where
     }
 }
 
+/// Captures the macOS system output through a Core Audio Process Tap.
+pub async fn run_pcm_stream<F>(stop: Arc<AtomicBool>, on_samples: F) -> Result<()>
+where
+    F: FnMut(&[f32], u32) + Send + 'static,
+{
+    run_helper_stream(None, stop, on_samples).await
+}
+
+/// Captures the default macOS microphone as mono Float32 PCM.
+pub async fn run_microphone_pcm_stream<F>(stop: Arc<AtomicBool>, on_samples: F) -> Result<()>
+where
+    F: FnMut(&[f32], u32) + Send + 'static,
+{
+    run_helper_stream(Some("microphone"), stop, on_samples).await
+}

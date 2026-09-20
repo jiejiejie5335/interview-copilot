@@ -5,13 +5,16 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
+import AVFoundation
 
 enum TapError: Error, CustomStringConvertible {
     case status(String, OSStatus)
+    case message(String)
 
     var description: String {
         switch self {
         case let .status(operation, code): return "\(operation) failed (OSStatus \(code))"
+        case let .message(message): return message
         }
     }
 }
@@ -140,16 +143,113 @@ final class SystemAudioTap {
     deinit { stop() }
 }
 
+final class MicrophoneCapture {
+    private let engine = AVAudioEngine()
+    private let writerQueue = DispatchQueue(
+        label: "com.interviewcopilot.microphone-writer",
+        qos: .userInitiated
+    )
+    private var tapInstalled = false
+
+    private func requestPermission() throws {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .denied, .restricted:
+            throw TapError.message("麦克风权限未开启，请到 系统设置 → 隐私与安全性 → 麦克风 中允许 Interview Copilot")
+        case .notDetermined:
+            let semaphore = DispatchSemaphore(value: 0)
+            var granted = false
+            AVCaptureDevice.requestAccess(for: .audio) { allowed in
+                granted = allowed
+                semaphore.signal()
+            }
+            semaphore.wait()
+            if !granted {
+                throw TapError.message("未获得麦克风权限")
+            }
+        @unknown default:
+            throw TapError.message("无法确认麦克风权限状态")
+        }
+    }
+
+    func start() throws {
+        try requestPermission()
+
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw TapError.message("默认麦克风没有可用的输入格式")
+        }
+
+        let outputHandle = FileHandle.standardOutput
+        let channelCount = Int(format.channelCount)
+        input.installTap(onBus: 0, bufferSize: 2_048, format: format) {
+            [writerQueue] buffer, _ in
+            guard let channels = buffer.floatChannelData else { return }
+            let frameCount = Int(buffer.frameLength)
+            guard frameCount > 0 else { return }
+
+            var mono = [Float](repeating: 0, count: frameCount)
+            for channel in 0..<channelCount {
+                let samples = channels[channel]
+                for frame in 0..<frameCount {
+                    mono[frame] += samples[frame]
+                }
+            }
+            if channelCount > 1 {
+                let scale = 1.0 / Float(channelCount)
+                for frame in 0..<frameCount {
+                    mono[frame] *= scale
+                }
+            }
+
+            writerQueue.async {
+                mono.withUnsafeBytes { bytes in
+                    outputHandle.write(Data(bytes))
+                }
+            }
+        }
+        tapInstalled = true
+
+        let header = "{\"sampleRate\":\(Int(format.sampleRate)),\"channels\":1,\"format\":\"f32le\"}\n"
+        outputHandle.write(Data(header.utf8))
+        engine.prepare()
+        try engine.start()
+    }
+
+    func stop() {
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        engine.stop()
+    }
+
+    deinit { stop() }
+}
+
 @main
 enum AudioTapMain {
     static func main() {
-        let tap = SystemAudioTap()
-        do {
-            try tap.start()
-            dispatchMain()
-        } catch {
-            FileHandle.standardError.write(Data("\(error)\n".utf8))
-            exit(1)
+        if CommandLine.arguments.dropFirst().first == "microphone" {
+            let microphone = MicrophoneCapture()
+            do {
+                try microphone.start()
+                dispatchMain()
+            } catch {
+                FileHandle.standardError.write(Data("\(error)\n".utf8))
+                exit(1)
+            }
+        } else {
+            let tap = SystemAudioTap()
+            do {
+                try tap.start()
+                dispatchMain()
+            } catch {
+                FileHandle.standardError.write(Data("\(error)\n".utf8))
+                exit(1)
+            }
         }
     }
 }

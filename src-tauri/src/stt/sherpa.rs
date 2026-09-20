@@ -419,21 +419,28 @@ fn is_likely_hallucination(text: &str) -> bool {
     )
 }
 
-fn emit_transcript(app: &AppHandle, event_name: &str, id: &str, text: String, is_final: bool) {
+fn emit_transcript(
+    app: &AppHandle,
+    event_name: &str,
+    id: &str,
+    text: String,
+    speaker: &'static str,
+    is_final: bool,
+) {
     let _ = app.emit(
         event_name,
         TranscriptEvent {
             id: id.to_string(),
             text,
-            speaker: "interviewer",
+            speaker,
             is_final,
         },
     );
 }
 
-fn next_transcript_id() -> String {
+fn next_transcript_id(speaker: &str) -> String {
     format!(
-        "stt-{}",
+        "stt-{speaker}-{}",
         TRANSCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -444,16 +451,29 @@ fn run_refinement_worker(
     hotword_entries: Vec<HotwordEntry>,
     extra_hotwords: String,
     refinement_model: RefinementModel,
+    speaker: &'static str,
 ) {
+    let speaker_label = if speaker == "interviewer" { "面试官" } else { "我的回答" };
     let model_label = refinement_model.label();
-    emit_status(&app, "loading", format!("正在加载 {model_label} 最终识别模型…"));
+    emit_status(
+        &app,
+        "loading",
+        format!("正在为{speaker_label}加载 {model_label} 最终识别模型…"),
+    );
     let recognizer = match create_refinement_recognizer(refinement_model, &extra_hotwords) {
         Ok(recognizer) => recognizer,
         Err(error) => {
             emit_status(&app, "error", error.to_string());
             while let Ok(job) = receiver.recv() {
                 let fallback = normalize_hotword_aliases(&job.fast_text, &hotword_entries).0;
-                emit_transcript(&app, "transcript-final", &job.id, fallback, true);
+                emit_transcript(
+                    &app,
+                    "transcript-final",
+                    &job.id,
+                    fallback,
+                    speaker,
+                    true,
+                );
             }
             return;
         }
@@ -461,7 +481,7 @@ fn run_refinement_worker(
     emit_status(
         &app,
         "listening",
-        format!("实时识别与 {model_label} 最终校正已就绪"),
+        format!("{speaker_label}实时识别与 {model_label} 最终校正已就绪"),
     );
 
     while let Ok(job) = receiver.recv() {
@@ -476,7 +496,14 @@ fn run_refinement_worker(
         } else {
             select_final_text(&job.fast_text, &refined, &hotword_entries)
         };
-        emit_transcript(&app, "transcript-final", &job.id, final_text, true);
+        emit_transcript(
+            &app,
+            "transcript-final",
+            &job.id,
+            final_text,
+            speaker,
+            true,
+        );
         emit_status(
             &app,
             "listening",
@@ -496,6 +523,7 @@ fn submit_refinement(
     fast_text: String,
     samples: Vec<f32>,
     sample_rate: u32,
+    speaker: &'static str,
 ) {
     let fallback_id = id.clone();
     let fallback_text = fast_text.clone();
@@ -509,7 +537,14 @@ fn submit_refinement(
         Ok(()) => emit_status(app, "transcribing", "高精度模型正在生成最终转写…"),
         Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
             let fallback = normalize_hotword_aliases(&fallback_text, hotword_entries).0;
-            emit_transcript(app, "transcript-final", &fallback_id, fallback, true);
+            emit_transcript(
+                app,
+                "transcript-final",
+                &fallback_id,
+                fallback,
+                speaker,
+                true,
+            );
             emit_status(app, "listening", "最终校正队列繁忙，已保留实时转写");
         }
     }
@@ -522,9 +557,15 @@ pub fn run_streaming_worker(
     mut receiver: mpsc::Receiver<AudioChunk>,
     extra_hotwords: String,
     refinement_model: RefinementModel,
+    speaker: &'static str,
 ) {
+    let speaker_label = if speaker == "interviewer" { "面试官" } else { "我的回答" };
     let hotword_entries = parse_hotwords(&extra_hotwords);
-    emit_status(&app, "loading", "正在加载中英双语流式识别模型…");
+    emit_status(
+        &app,
+        "loading",
+        format!("正在为{speaker_label}加载中英双语流式识别模型…"),
+    );
     let recognizer = match create_recognizer(&extra_hotwords) {
         Ok(recognizer) => recognizer,
         Err(error) => {
@@ -545,15 +586,20 @@ pub fn run_streaming_worker(
             refinement_hotwords,
             refinement_extra_hotwords,
             refinement_model,
+            speaker,
         )
     });
 
     let mut stream = recognizer.create_stream();
-    let mut transcript_id = next_transcript_id();
+    let mut transcript_id = next_transcript_id(speaker);
     let mut last_partial = String::new();
     let mut last_sample_rate = 16_000_u32;
     let mut utterance_audio = Vec::<f32>::new();
-    emit_status(&app, "listening", "流式识别已就绪，正在监听系统音频");
+    emit_status(
+        &app,
+        "listening",
+        format!("{speaker_label}流式识别已就绪"),
+    );
 
     while let Some(chunk) = receiver.blocking_recv() {
         last_sample_rate = chunk.sample_rate;
@@ -570,7 +616,14 @@ pub fn run_streaming_worker(
         let text = normalize_hotword_aliases(&raw_text, &hotword_entries).0;
 
         if !text.is_empty() && text != last_partial && !is_likely_hallucination(&text) {
-            emit_transcript(&app, "transcript-partial", &transcript_id, text.clone(), false);
+            emit_transcript(
+                &app,
+                "transcript-partial",
+                &transcript_id,
+                text.clone(),
+                speaker,
+                false,
+            );
             last_partial = text.clone();
         }
 
@@ -584,13 +637,14 @@ pub fn run_streaming_worker(
                     text,
                     std::mem::take(&mut utterance_audio),
                     last_sample_rate,
+                    speaker,
                 );
             } else {
                 utterance_audio.clear();
             }
             recognizer.reset(&stream);
             stream = recognizer.create_stream();
-            transcript_id = next_transcript_id();
+            transcript_id = next_transcript_id(speaker);
             last_partial.clear();
         }
     }
@@ -615,6 +669,7 @@ pub fn run_streaming_worker(
                 normalize_hotword_aliases(&text, &hotword_entries).0,
                 utterance_audio,
                 last_sample_rate,
+                speaker,
             );
         }
     }

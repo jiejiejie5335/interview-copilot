@@ -46,6 +46,89 @@ struct AudioLevelEvent {
     rms: f32,
     peak: f32,
     sample_rate: u32,
+    speaker: &'static str,
+}
+
+fn spawn_stt_worker(
+    app: AppHandle,
+    receiver: mpsc::Receiver<AudioChunk>,
+    config: SttConfig,
+    speaker: &'static str,
+    stop: Arc<AtomicBool>,
+) {
+    match config.mode {
+        SttMode::LocalFast | SttMode::LocalAccurate => {
+            let refinement_model = match config.mode {
+                SttMode::LocalFast => RefinementModel::SenseVoice,
+                SttMode::LocalAccurate => RefinementModel::Qwen3,
+                SttMode::TencentCloud => unreachable!(),
+            };
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::stt::run_streaming_worker(
+                    app,
+                    receiver,
+                    config.hotwords,
+                    refinement_model,
+                    speaker,
+                )
+            });
+        }
+        SttMode::TencentCloud => {
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = crate::stt::run_tencent_streaming_worker(
+                    app.clone(),
+                    receiver,
+                    config.tencent,
+                    config.hotwords,
+                    speaker,
+                )
+                .await
+                {
+                    let source = if speaker == "interviewer" { "系统音频" } else { "麦克风" };
+                    let _ = app.emit("audio-error", format!("{source}识别失败：{error}"));
+                    stop.store(true, Ordering::Release);
+                }
+            });
+        }
+    }
+}
+
+fn audio_handler(
+    app: AppHandle,
+    sender: mpsc::Sender<AudioChunk>,
+    speaker: &'static str,
+) -> impl FnMut(&[f32], u32) + Send + 'static {
+    let mut meter_squares = 0.0_f32;
+    let mut meter_peak = 0.0_f32;
+    let mut meter_samples = 0_usize;
+
+    move |samples, sample_rate| {
+        meter_squares += samples.iter().map(|sample| sample * sample).sum::<f32>();
+        meter_peak = samples
+            .iter()
+            .fold(meter_peak, |peak, sample| peak.max(sample.abs()));
+        meter_samples += samples.len();
+        if meter_samples >= (sample_rate / 20).max(256) as usize {
+            let rms = (meter_squares / meter_samples as f32).sqrt();
+            let _ = app.emit(
+                "audio-level",
+                AudioLevelEvent {
+                    rms,
+                    peak: meter_peak,
+                    sample_rate,
+                    speaker,
+                },
+            );
+            meter_squares = 0.0;
+            meter_peak = 0.0;
+            meter_samples = 0;
+        }
+
+        let _ = sender.try_send(AudioChunk {
+            samples: samples.to_vec(),
+            sample_rate,
+        });
+    }
 }
 
 #[tauri::command]
@@ -89,79 +172,55 @@ pub async fn start_audio_capture(
         let running = runtime.running.clone();
 
         tauri::async_runtime::spawn(async move {
-            // About 10 seconds of buffering covers the one-time model load without
-            // ever blocking Core Audio's capture callback.
-            let (audio_sender, audio_receiver) = mpsc::channel::<AudioChunk>(64);
-            let worker_app = app_handle.clone();
-            let worker_hotwords = config.hotwords.clone();
-            let worker_stop = stop.clone();
-            match config.mode {
-                SttMode::LocalFast | SttMode::LocalAccurate => {
-                    let refinement_model = match config.mode {
-                        SttMode::LocalFast => RefinementModel::SenseVoice,
-                        SttMode::LocalAccurate => RefinementModel::Qwen3,
-                        SttMode::TencentCloud => unreachable!(),
-                    };
-                    tauri::async_runtime::spawn_blocking(move || {
-                        crate::stt::run_streaming_worker(
-                            worker_app,
-                            audio_receiver,
-                            worker_hotwords,
-                            refinement_model,
-                        )
-                    });
-                }
-                SttMode::TencentCloud => {
-                    let tencent_config = config.tencent.clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(error) = crate::stt::run_tencent_streaming_worker(
-                            worker_app.clone(),
-                            audio_receiver,
-                            tencent_config,
-                            worker_hotwords,
-                        )
-                        .await
-                        {
-                            let _ = worker_app.emit("audio-error", error.to_string());
-                            worker_stop.store(true, Ordering::Release);
-                        }
-                    });
-                }
-            }
-            let mut meter_squares = 0.0_f32;
-            let mut meter_peak = 0.0_f32;
-            let mut meter_samples = 0_usize;
+            // Each source has an independent queue and recognizer so speaker
+            // attribution remains reliable even when both sides briefly overlap.
+            let (system_sender, system_receiver) = mpsc::channel::<AudioChunk>(256);
+            let (microphone_sender, microphone_receiver) = mpsc::channel::<AudioChunk>(256);
+            spawn_stt_worker(
+                app_handle.clone(),
+                system_receiver,
+                config.clone(),
+                "interviewer",
+                stop.clone(),
+            );
+            spawn_stt_worker(
+                app_handle.clone(),
+                microphone_receiver,
+                config,
+                "candidate",
+                stop.clone(),
+            );
 
-            let result = crate::audio::macos::run_pcm_stream(stop, move |samples, sample_rate| {
-                meter_squares += samples.iter().map(|sample| sample * sample).sum::<f32>();
-                meter_peak = samples
-                    .iter()
-                    .fold(meter_peak, |peak, sample| peak.max(sample.abs()));
-                meter_samples += samples.len();
-                if meter_samples >= (sample_rate / 20).max(256) as usize {
-                    let rms = (meter_squares / meter_samples as f32).sqrt();
-                    let _ = app_handle.emit(
-                        "audio-level",
-                        AudioLevelEvent {
-                            rms,
-                            peak: meter_peak,
-                            sample_rate,
-                        },
-                    );
-                    meter_squares = 0.0;
-                    meter_peak = 0.0;
-                    meter_samples = 0;
+            let system_capture = crate::audio::macos::run_pcm_stream(
+                stop.clone(),
+                audio_handler(app_handle.clone(), system_sender, "interviewer"),
+            );
+            let microphone_capture = crate::audio::macos::run_microphone_pcm_stream(
+                stop.clone(),
+                audio_handler(app_handle.clone(), microphone_sender, "candidate"),
+            );
+            tokio::pin!(system_capture, microphone_capture);
+
+            let (first_source, first_result, second_source, second_result) = tokio::select! {
+                result = &mut system_capture => {
+                    stop.store(true, Ordering::Release);
+                    let microphone_result = (&mut microphone_capture).await;
+                    ("系统音频", result, "麦克风", microphone_result)
                 }
+                result = &mut microphone_capture => {
+                    stop.store(true, Ordering::Release);
+                    let system_result = (&mut system_capture).await;
+                    ("麦克风", result, "系统音频", system_result)
+                }
+            };
 
-                let _ = audio_sender.try_send(AudioChunk {
-                    samples: samples.to_vec(),
-                    sample_rate,
-                });
-            })
-            .await;
-
-            if let Err(error) = result {
-                let _ = app.emit("audio-error", error.to_string());
+            for (source, result) in [
+                (first_source, first_result),
+                (second_source, second_result),
+            ] {
+                if let Err(error) = result {
+                    let _ = app.emit("audio-error", format!("{source}采集失败：{error}"));
+                }
             }
             running.store(false, Ordering::Release);
         });

@@ -5,6 +5,7 @@ src-tauri/target/
 /vite.config.js
 /vite.config.d.ts
 .DS_Store
+.idea/
 *.log
 .env
 .env.local

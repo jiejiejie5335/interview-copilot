@@ -200,7 +200,13 @@ fn sentence_values(value: &Value) -> Vec<&Value> {
     }
 }
 
-fn handle_response(app: &AppHandle, value: &Value, hotwords: &str, voice_id: &str) -> Result<bool> {
+fn handle_response(
+    app: &AppHandle,
+    value: &Value,
+    hotwords: &str,
+    voice_id: &str,
+    speaker: &'static str,
+) -> Result<bool> {
     message_error(value)?;
     for sentence in sentence_values(value) {
         let text = sentence
@@ -230,7 +236,7 @@ fn handle_response(app: &AppHandle, value: &Value, hotwords: &str, voice_id: &st
             TranscriptEvent {
                 id: format!("tencent-{voice_id}-{sentence_id}"),
                 text: normalize_transcript(text, hotwords),
-                speaker: "interviewer",
+                speaker,
                 is_final,
             },
         );
@@ -253,14 +259,20 @@ pub async fn run_tencent_streaming_worker(
     mut receiver: mpsc::Receiver<AudioChunk>,
     config: TencentAsrConfig,
     hotwords: String,
+    speaker: &'static str,
 ) -> Result<()> {
+    let speaker_label = if speaker == "interviewer" { "面试官" } else { "我的回答" };
     config.validate()?;
-    emit_status(&app, "loading", "正在连接腾讯云 ASR 大模型 2.0…");
+    emit_status(
+        &app,
+        "loading",
+        format!("正在为{speaker_label}连接腾讯云 ASR 大模型 2.0…"),
+    );
     let timestamp = unix_seconds()?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .subsec_nanos() as u64;
-    let voice_id = format!("interview-{timestamp}-{nonce}");
+    let voice_id = format!("interview-{speaker}-{timestamp}-{nonce}");
     let url = build_signed_url(&config, &hotwords, timestamp, nonce, &voice_id)?;
     let (mut websocket, _) = connect_async(url)
         .await
@@ -276,7 +288,11 @@ pub async fn run_tencent_streaming_worker(
     } else {
         return Err(anyhow!("腾讯云 ASR 未返回握手确认"));
     }
-    emit_status(&app, "listening", "腾讯云 ASR 大模型 2.0 已连接，正在实时识别");
+    emit_status(
+        &app,
+        "listening",
+        format!("{speaker_label}腾讯云 ASR 已连接"),
+    );
 
     let mut resampler = LinearResampler::default();
     let mut buffered_samples = Vec::<f32>::new();
@@ -297,7 +313,7 @@ pub async fn run_tencent_streaming_worker(
                 match message? {
                     Message::Text(text) => {
                         let value: Value = serde_json::from_str(text.as_ref())?;
-                        if handle_response(&app, &value, &hotwords, &voice_id)? {
+                        if handle_response(&app, &value, &hotwords, &voice_id, speaker)? {
                             return Ok(());
                         }
                     }
@@ -325,7 +341,7 @@ pub async fn run_tencent_streaming_worker(
         match message? {
             Message::Text(text) => {
                 let value: Value = serde_json::from_str(text.as_ref())?;
-                if handle_response(&app, &value, &hotwords, &voice_id)? {
+                if handle_response(&app, &value, &hotwords, &voice_id, speaker)? {
                     break;
                 }
             }
