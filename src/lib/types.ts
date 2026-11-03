@@ -1,5 +1,7 @@
 export type DetectedLanguage = "zh" | "en" | "mixed" | "unknown";
 export type AnswerLanguage = "zh" | "en";
+export type TranscriptSpeaker = "interviewer" | "candidate";
+export type AudioSourceSpeaker = TranscriptSpeaker | "ambient";
 
 export interface QuestionDetection {
   isQuestion: boolean;
@@ -11,7 +13,7 @@ export interface QuestionDetection {
 
 export interface TranscriptEntry {
   id: string;
-  speaker: "interviewer" | "candidate";
+  speaker: TranscriptSpeaker;
   text: string;
   language: DetectedLanguage;
   timestamp: number;
@@ -62,13 +64,13 @@ export interface AudioLevelEvent {
   rms: number;
   peak: number;
   sampleRate: number;
-  speaker: "interviewer" | "candidate";
+  speaker: AudioSourceSpeaker;
 }
 
 export interface TranscriptFinalEvent {
   id: string;
   text: string;
-  speaker: "interviewer" | "candidate";
+  speaker: AudioSourceSpeaker;
   isFinal: boolean;
 }
 
@@ -91,4 +93,14 @@ export interface SttConfig {
   mode: SttMode;
   hotwords: string;
   tencent: TencentAsrConfig;
+}
+
+export interface RuntimeInfo {
+  platform: string;
+  mobile: boolean;
+  audioCapture: "dual" | "ambient";
+}
+
+export interface CaptureStarted {
+  audioCapture: "dual" | "ambient";
 }

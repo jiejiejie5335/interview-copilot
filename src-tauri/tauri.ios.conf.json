@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Interview Copilot",
+  "identifier": "com.interviewcopilot.mobile",
+  "app": {
+    "windows": [
+      {
+        "title": "Interview Copilot",
+        "transparent": false,
+        "fullscreen": true,
+        "resizable": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "iOS": {
+      "minimumSystemVersion": "16.0"
+    }
+  }
+}

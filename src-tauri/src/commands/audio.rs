@@ -3,12 +3,18 @@ use std::sync::{
     Arc, Mutex,
 };
 
+#[cfg(target_os = "ios")]
+use std::sync::OnceLock;
+
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
 use crate::stt::{AudioChunk, RefinementModel, TencentAsrConfig};
 
 use super::secrets::{load_secret, SecretKind};
+
+#[cfg(target_os = "ios")]
+use tauri_plugin_ios_ambient_audio::{CaptureRequest, IosAmbientAudioExt};
 
 #[derive(Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +55,71 @@ struct AudioLevelEvent {
     speaker: &'static str,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureStarted {
+    audio_capture: &'static str,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Clone)]
+struct IosAudioSink {
+    app: AppHandle,
+    sender: mpsc::Sender<AudioChunk>,
+}
+
+#[cfg(target_os = "ios")]
+static IOS_AUDIO_SINK: OnceLock<Mutex<Option<IosAudioSink>>> = OnceLock::new();
+
+#[cfg(target_os = "ios")]
+fn ios_audio_sink() -> &'static Mutex<Option<IosAudioSink>> {
+    IOS_AUDIO_SINK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_os = "ios")]
+fn set_ios_audio_sink(sink: Option<IosAudioSink>) -> Result<(), String> {
+    *ios_audio_sink()
+        .lock()
+        .map_err(|_| "iPhone 音频状态锁异常".to_string())? = sink;
+    Ok(())
+}
+
+/// Called by the Swift AVAudioEngine tap. Audio stays in memory and is copied
+/// directly into the bounded Tencent ASR queue.
+#[cfg(target_os = "ios")]
+#[no_mangle]
+pub unsafe extern "C" fn interview_audio_push_ffi(
+    samples: *const f32,
+    sample_count: i32,
+    sample_rate: u32,
+) {
+    if samples.is_null() || sample_count <= 0 || sample_rate == 0 {
+        return;
+    }
+    let Ok(sink) = ios_audio_sink().lock().map(|value| value.as_ref().cloned()) else {
+        return;
+    };
+    let Some(sink) = sink else { return };
+    let samples = unsafe { std::slice::from_raw_parts(samples, sample_count as usize) };
+    let squares = samples.iter().map(|sample| sample * sample).sum::<f32>();
+    let peak = samples
+        .iter()
+        .fold(0.0_f32, |current, sample| current.max(sample.abs()));
+    let _ = sink.app.emit(
+        "audio-level",
+        AudioLevelEvent {
+            rms: (squares / samples.len() as f32).sqrt(),
+            peak,
+            sample_rate,
+            speaker: "ambient",
+        },
+    );
+    let _ = sink.sender.try_send(AudioChunk {
+        samples: samples.to_vec(),
+        sample_rate,
+    });
+}
+
 fn spawn_stt_worker(
     app: AppHandle,
     receiver: mpsc::Receiver<AudioChunk>,
@@ -84,7 +155,11 @@ fn spawn_stt_worker(
                 )
                 .await
                 {
-                    let source = if speaker == "interviewer" { "系统音频" } else { "麦克风" };
+                    let source = if speaker == "interviewer" {
+                        "系统音频"
+                    } else {
+                        "麦克风"
+                    };
                     let _ = app.emit("audio-error", format!("{source}识别失败：{error}"));
                     stop.store(true, Ordering::Release);
                 }
@@ -136,32 +211,37 @@ pub async fn start_audio_capture(
     app: AppHandle,
     runtime: State<'_, AudioRuntime>,
     mut config: SttConfig,
-) -> Result<(), String> {
-    if matches!(config.mode, SttMode::TencentCloud)
-        && config.tencent.secret_key.trim().is_empty()
-    {
+) -> Result<CaptureStarted, String> {
+    if matches!(config.mode, SttMode::TencentCloud) && config.tencent.secret_key.trim().is_empty() {
         config.tencent.secret_key = load_secret(SecretKind::TencentSecretKey)?
             .ok_or_else(|| "请先保存腾讯云 SecretKey".to_string())?;
     }
     match config.mode {
-        SttMode::LocalFast => {
-            crate::stt::validate_local_installation(RefinementModel::SenseVoice)
-        }
-        SttMode::LocalAccurate => {
-            crate::stt::validate_local_installation(RefinementModel::Qwen3)
-        }
+        SttMode::LocalFast => crate::stt::validate_local_installation(RefinementModel::SenseVoice),
+        SttMode::LocalAccurate => crate::stt::validate_local_installation(RefinementModel::Qwen3),
         SttMode::TencentCloud => config.tencent.validate(),
     }
     .map_err(|error| error.to_string())?;
 
-    if runtime.running.swap(true, Ordering::AcqRel) {
-        return Ok(());
+    #[cfg(target_os = "ios")]
+    if !matches!(config.mode, SttMode::TencentCloud) {
+        return Err("iPhone 环境监听首版仅支持腾讯云实时语音识别".to_string());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    if runtime.running.swap(true, Ordering::AcqRel) {
+        return Ok(CaptureStarted {
+            audio_capture: if cfg!(target_os = "ios") {
+                "ambient"
+            } else {
+                "dual"
+            },
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         runtime.running.store(false, Ordering::Release);
-        return Err("当前版本仅实现 macOS 系统音频捕获".to_string());
+        return Err("当前版本仅实现 macOS 双通道和 iPhone 环境音频捕获".to_string());
     }
 
     #[cfg(target_os = "macos")]
@@ -214,22 +294,45 @@ pub async fn start_audio_capture(
                 }
             };
 
-            for (source, result) in [
-                (first_source, first_result),
-                (second_source, second_result),
-            ] {
+            for (source, result) in [(first_source, first_result), (second_source, second_result)] {
                 if let Err(error) = result {
                     let _ = app.emit("audio-error", format!("{source}采集失败：{error}"));
                 }
             }
             running.store(false, Ordering::Release);
         });
-        Ok(())
+        Ok(CaptureStarted {
+            audio_capture: "dual",
+        })
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        *runtime.stop_signal.lock().map_err(|_| "音频状态锁异常")? = Some(stop.clone());
+        let (sender, receiver) = mpsc::channel::<AudioChunk>(256);
+        set_ios_audio_sink(Some(IosAudioSink {
+            app: app.clone(),
+            sender,
+        }))?;
+        spawn_stt_worker(app.clone(), receiver, config, "ambient", stop.clone());
+
+        if let Err(error) = app.ios_ambient_audio().start_capture(CaptureRequest {
+            preferred_sample_rate: Some(48_000.0),
+        }) {
+            stop.store(true, Ordering::Release);
+            let _ = set_ios_audio_sink(None);
+            runtime.running.store(false, Ordering::Release);
+            return Err(error.to_string());
+        }
+        Ok(CaptureStarted {
+            audio_capture: "ambient",
+        })
     }
 }
 
 #[tauri::command]
-pub fn stop_audio_capture(runtime: State<'_, AudioRuntime>) -> Result<(), String> {
+pub fn stop_audio_capture(_app: AppHandle, runtime: State<'_, AudioRuntime>) -> Result<(), String> {
     if let Some(stop) = runtime
         .stop_signal
         .lock()
@@ -237,6 +340,11 @@ pub fn stop_audio_capture(runtime: State<'_, AudioRuntime>) -> Result<(), String
         .take()
     {
         stop.store(true, Ordering::Release);
+    }
+    #[cfg(target_os = "ios")]
+    {
+        let _ = _app.ios_ambient_audio().stop_capture();
+        set_ios_audio_sink(None)?;
     }
     runtime.running.store(false, Ordering::Release);
     Ok(())

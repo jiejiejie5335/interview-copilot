@@ -8,6 +8,13 @@
   text-rendering: optimizeLegibility;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+}
+
 html.transparent-mode body {
   background: transparent;
 }
@@ -19,7 +26,8 @@ html.transparent-mode body {
 body {
   margin: 0;
   min-width: 860px;
-  min-height: 100vh;
+  min-height: 100%;
+  overflow: hidden;
   background:
     radial-gradient(circle at 20% -10%, rgba(72, 151, 255, 0.12), transparent 36%),
     radial-gradient(circle at 100% 10%, rgba(44, 210, 164, 0.09), transparent 28%),
@@ -38,7 +46,12 @@ button {
 }
 
 .app-shell {
-  min-height: 100vh;
+  display: flex;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
   padding: 22px;
 }
 
@@ -52,6 +65,7 @@ button {
 }
 
 .topbar {
+  flex: 0 0 auto;
   padding: 0 2px 20px;
 }
 
@@ -169,7 +183,10 @@ p {
 }
 
 .settings-panel {
+  flex: 0 0 auto;
+  max-height: min(46dvh, 430px);
   margin-bottom: 16px;
+  overflow-y: auto;
   padding: 18px;
   border-radius: 15px;
 }
@@ -306,20 +323,24 @@ textarea {
 
 .workspace-grid {
   display: grid;
+  flex: 1 1 auto;
   grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
   gap: 16px;
-  min-height: calc(100vh - 96px);
+  min-height: 0;
 }
 
 .panel {
   display: flex;
-  min-height: 640px;
+  height: 100%;
+  min-height: 0;
   flex-direction: column;
   border-radius: 16px;
   overflow: hidden;
 }
 
 .panel-header {
+  z-index: 2;
+  flex: 0 0 auto;
   padding: 17px 18px;
   border-bottom: 1px solid #202933;
 }
@@ -371,6 +392,7 @@ textarea {
 
 .audio-sources {
   display: grid;
+  flex: 0 0 auto;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   padding: 14px 18px 0;
@@ -532,6 +554,7 @@ textarea {
 
 .transcript-composer {
   display: grid;
+  flex: 0 0 auto;
   grid-template-columns: 88px 1fr auto;
   gap: 8px;
   padding: 14px 18px 18px;
@@ -544,6 +567,7 @@ textarea {
 
 .detection-card {
   display: grid;
+  flex: 0 0 auto;
   grid-template-columns: repeat(4, 1fr);
   gap: 1px;
   margin: 16px 18px;
@@ -559,6 +583,7 @@ textarea {
 
 .answer-hints {
   display: grid;
+  flex: 0 0 auto;
   gap: 7px;
   margin: 0 18px 14px;
 }
@@ -606,7 +631,9 @@ textarea {
 
 .answer-content {
   flex: 1;
+  min-height: 0;
   margin: 0 18px 18px;
+  overflow-y: auto;
   border: 1px solid #222c36;
   border-radius: 13px;
   background:
@@ -653,6 +680,95 @@ textarea {
   color: #667382;
   font-size: 11px;
   line-height: 1.7;
+}
+
+.manual-controls {
+  position: fixed;
+  z-index: 30;
+  right: max(10px, env(safe-area-inset-right));
+  bottom: max(8px, env(safe-area-inset-bottom));
+  left: max(10px, env(safe-area-inset-left));
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(150px, 0.72fr) minmax(170px, 0.82fr);
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(59, 73, 88, 0.95);
+  border-radius: 16px;
+  background: rgba(8, 13, 19, 0.96);
+  box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(18px);
+}
+
+.manual-state {
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  padding: 0 10px;
+}
+
+.manual-state span {
+  color: #65d2aa;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.manual-controls.answer .manual-state span {
+  color: #93a9ff;
+}
+
+.manual-controls.appending .manual-state span {
+  color: #ffbd76;
+}
+
+.manual-state strong {
+  color: #7d8996;
+  font-size: 9px;
+  font-weight: 500;
+}
+
+.manual-controls button {
+  display: grid;
+  min-height: 58px;
+  place-content: center;
+  gap: 3px;
+  border: 1px solid rgba(65, 84, 104, 0.9);
+  border-radius: 12px;
+  color: #dce8f2;
+  background: #141c25;
+}
+
+.manual-controls button span {
+  font-size: 17px;
+  font-weight: 760;
+}
+
+.manual-controls button small {
+  color: #718091;
+  font-size: 9px;
+}
+
+.manual-controls .append-question-button {
+  border-color: rgba(239, 163, 83, 0.45);
+  color: #ffc078;
+  background: rgba(106, 65, 25, 0.26);
+}
+
+.manual-controls .phase-action-button {
+  border-color: rgba(68, 203, 153, 0.48);
+  color: #8ae6c2;
+  background: rgba(23, 92, 70, 0.45);
+}
+
+.manual-controls.answer .phase-action-button {
+  border-color: rgba(109, 132, 241, 0.5);
+  color: #aebcff;
+  background: rgba(52, 65, 130, 0.38);
+}
+
+.manual-controls button:disabled {
+  cursor: default;
+  filter: saturate(0.25);
+  opacity: 0.38;
 }
 
 /* Pinned interview view: preserve readable content while revealing the app underneath. */
@@ -734,10 +850,204 @@ textarea {
   }
 
   .workspace-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+    gap: 10px;
   }
 
   .panel {
-    min-height: 570px;
+    min-height: 0;
+  }
+}
+
+.mobile-runtime {
+  min-height: 100dvh;
+  padding:
+    max(6px, env(safe-area-inset-top))
+    max(8px, env(safe-area-inset-right))
+    calc(82px + env(safe-area-inset-bottom))
+    max(8px, env(safe-area-inset-left));
+}
+
+.mobile-runtime .topbar {
+  min-height: 44px;
+  padding: 0 2px 7px;
+}
+
+.mobile-runtime .brand-mark {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+}
+
+.mobile-runtime .brand h1 {
+  font-size: 14px;
+}
+
+.mobile-runtime .brand p,
+.mobile-runtime .status-text,
+.mobile-runtime .quick-language > span {
+  display: none;
+}
+
+.mobile-runtime .topbar-actions {
+  flex-wrap: nowrap;
+}
+
+.mobile-runtime .quick-language select {
+  width: 118px;
+  padding: 6px 8px;
+  font-size: 10px;
+}
+
+.mobile-runtime .ghost-button,
+.mobile-runtime .listen-button,
+.mobile-runtime .ask-button {
+  padding: 7px 10px;
+  font-size: 10px;
+}
+
+.mobile-runtime .workspace-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  min-height: 0;
+}
+
+.mobile-runtime .panel {
+  height: calc(100dvh - 142px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+  min-height: 220px;
+  border-radius: 12px;
+}
+
+.mobile-runtime .panel-header {
+  padding: 9px 11px;
+}
+
+.mobile-runtime .panel-header .eyebrow,
+.mobile-runtime .detection-card,
+.mobile-runtime .answer-hints > small,
+.mobile-runtime .transcript-composer {
+  display: none;
+}
+
+.mobile-runtime .panel-header h2 {
+  font-size: 13px;
+}
+
+.mobile-runtime .audio-sources {
+  grid-template-columns: 1fr;
+  padding: 7px 11px 0;
+}
+
+.mobile-runtime .audio-source > div:first-child {
+  align-items: center;
+}
+
+.mobile-runtime .transcript-list {
+  padding: 8px 10px;
+}
+
+.mobile-runtime .empty-state {
+  min-height: 0;
+  padding: 12px;
+  font-size: 10px;
+}
+
+.mobile-runtime .transcript-row {
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  gap: 6px;
+  margin-bottom: 6px;
+  padding: 8px;
+}
+
+.mobile-runtime .transcript-row > small {
+  display: none;
+}
+
+.mobile-runtime .transcript-row p {
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.mobile-runtime .row-delete-button {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.mobile-runtime .answer-hints {
+  margin: 7px 10px;
+}
+
+.mobile-runtime .answer-hints textarea {
+  min-height: 36px;
+  max-height: 48px;
+  padding: 6px 8px;
+  font-size: 10px;
+}
+
+.mobile-runtime .answer-content {
+  min-height: 0;
+  margin: 0 10px 10px;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.mobile-runtime .answer-content > p {
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.mobile-runtime .answer-placeholder {
+  min-height: 0;
+}
+
+.mobile-runtime .answer-placeholder span {
+  width: 32px;
+  height: 32px;
+  margin-bottom: 8px;
+}
+
+.mobile-runtime .answer-placeholder h3 {
+  font-size: 12px;
+}
+
+.mobile-runtime .answer-placeholder p {
+  font-size: 9px;
+}
+
+.mobile-runtime .settings-panel {
+  position: fixed;
+  z-index: 40;
+  inset:
+    max(6px, env(safe-area-inset-top))
+    max(8px, env(safe-area-inset-right))
+    max(6px, env(safe-area-inset-bottom))
+    max(8px, env(safe-area-inset-left));
+  margin: 0;
+  max-height: none;
+  overflow-y: auto;
+  border-radius: 14px;
+  background: rgba(10, 15, 21, 0.99);
+}
+
+.mobile-runtime .settings-grid,
+.mobile-runtime .context-grid,
+.mobile-runtime .translation-settings {
+  grid-template-columns: 1fr 1fr;
+}
+
+@media (orientation: portrait) {
+  .mobile-runtime::before {
+    position: fixed;
+    z-index: 100;
+    inset: 0;
+    display: grid;
+    place-content: center;
+    padding: 32px;
+    color: #e8eef5;
+    background: #080b0f;
+    content: "请将 iPhone 旋转为横屏使用";
+    text-align: center;
+    font-size: 18px;
+    font-weight: 700;
   }
 }

@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -12,7 +15,10 @@ use tokio::{sync::mpsc, time::timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use url::form_urlencoded::byte_serialize;
 
-use super::{sherpa::{hotword_terms, normalize_transcript}, AudioChunk};
+use super::{
+    text::{hotword_terms, normalize_transcript},
+    AudioChunk,
+};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const PACKET_SAMPLES: usize = 640;
@@ -32,7 +38,11 @@ impl TencentAsrConfig {
             || self.secret_key.trim().is_empty()
         {
             Err(anyhow!("腾讯云模式需要填写 AppID、SecretId 和 SecretKey"))
-        } else if !self.app_id.chars().all(|character| character.is_ascii_digit()) {
+        } else if !self
+            .app_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
             Err(anyhow!("腾讯云 AppID 应为纯数字"))
         } else {
             Ok(())
@@ -247,9 +257,7 @@ fn handle_response(
 fn samples_to_pcm(samples: &[f32]) -> Vec<u8> {
     let mut pcm = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
-        pcm.extend_from_slice(
-            &((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes(),
-        );
+        pcm.extend_from_slice(&((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16).to_le_bytes());
     }
     pcm
 }
@@ -261,7 +269,11 @@ pub async fn run_tencent_streaming_worker(
     hotwords: String,
     speaker: &'static str,
 ) -> Result<()> {
-    let speaker_label = if speaker == "interviewer" { "面试官" } else { "我的回答" };
+    let speaker_label = if speaker == "interviewer" {
+        "面试官"
+    } else {
+        "我的回答"
+    };
     config.validate()?;
     emit_status(
         &app,
@@ -269,9 +281,7 @@ pub async fn run_tencent_streaming_worker(
         format!("正在为{speaker_label}连接腾讯云 ASR 大模型 2.0…"),
     );
     let timestamp = unix_seconds()?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .subsec_nanos() as u64;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as u64;
     let voice_id = format!("interview-{speaker}-{timestamp}-{nonce}");
     let url = build_signed_url(&config, &hotwords, timestamp, nonce, &voice_id)?;
     let (mut websocket, _) = connect_async(url)
@@ -337,7 +347,9 @@ pub async fn run_tencent_streaming_worker(
         let message = timeout(Duration::from_secs(20), websocket.next())
             .await
             .context("等待腾讯云最终结果超时")?;
-        let Some(message) = message else { break; };
+        let Some(message) = message else {
+            break;
+        };
         match message? {
             Message::Text(text) => {
                 let value: Value = serde_json::from_str(text.as_ref())?;
@@ -366,7 +378,10 @@ mod tests {
 
     #[test]
     fn converts_float_samples_to_little_endian_pcm16() {
-        assert_eq!(samples_to_pcm(&[0.0, 1.0, -1.0]), vec![0, 0, 255, 127, 1, 128]);
+        assert_eq!(
+            samples_to_pcm(&[0.0, 1.0, -1.0]),
+            vec![0, 0, 255, 127, 1, 128]
+        );
     }
 
     #[test]

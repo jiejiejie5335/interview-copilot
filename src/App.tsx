@@ -7,9 +7,12 @@ import { buildInterviewMessages } from "./lib/prompts";
 import { translateToChinese } from "./lib/translation";
 import type {
   AnswerLanguage,
+  AudioSourceSpeaker,
   AudioLevelEvent,
+  CaptureStarted,
   LlmStreamEvent,
   ProviderConfig,
+  RuntimeInfo,
   SttStatusEvent,
   SttConfig,
   TranscriptEntry,
@@ -17,6 +20,17 @@ import type {
   TranscriptPartialEvent,
   TranslationConfig,
 } from "./lib/types";
+
+type ManualInterviewPhase = "question" | "answer";
+
+const DEFAULT_RUNTIME_INFO: RuntimeInfo = {
+  platform: "macos",
+  mobile: false,
+  audioCapture: "dual",
+};
+
+const QUESTION_TAIL_DELAY_MS = 450;
+const QUESTION_APPEND_ROLLBACK_MS = 3_500;
 
 const DEFAULT_PROVIDER: ProviderConfig = {
   name: "DeepSeek",
@@ -199,12 +213,13 @@ function saveWindowPreferences(preferences: WindowPreferences) {
 }
 
 function App() {
+  const [runtimeInfo, setRuntimeInfo] = useState(DEFAULT_RUNTIME_INFO);
+  const [runtimeReady, setRuntimeReady] = useState(false);
   const [listening, setListening] = useState(false);
-  const [audioLevels, setAudioLevels] = useState<
-    Record<TranscriptEntry["speaker"], AudioLevelEvent>
-  >({
+  const [audioLevels, setAudioLevels] = useState<Record<AudioSourceSpeaker, AudioLevelEvent>>({
     interviewer: { rms: 0, peak: 0, sampleRate: 0, speaker: "interviewer" },
     candidate: { rms: 0, peak: 0, sampleRate: 0, speaker: "candidate" },
+    ambient: { rms: 0, peak: 0, sampleRate: 0, speaker: "ambient" },
   });
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [partialTranscripts, setPartialTranscripts] = useState<
@@ -213,6 +228,18 @@ function App() {
   const deletedTranscriptIdsRef = useRef(new Set<string>());
   const transcriptStartTimesRef = useRef(new Map<string, number>());
   const translationRequestsRef = useRef(new Set<string>());
+  const ambientTranscriptIdsRef = useRef(new Set<string>());
+  const ambientSpeakerAssignmentsRef = useRef(
+    new Map<string, TranscriptEntry["speaker"]>(),
+  );
+  const ambientSpeakerRef = useRef<TranscriptEntry["speaker"]>("interviewer");
+  const transcriptRef = useRef<TranscriptEntry[]>([]);
+  const transcriptListRef = useRef<HTMLDivElement>(null);
+  const transcriptAutoFollowRef = useRef(true);
+  const partialTranscriptsRef = useRef<
+    Partial<Record<TranscriptEntry["speaker"], TranscriptEntry>>
+  >({});
+  const questionWindowStartRef = useRef(Date.now());
   const [draft, setDraft] = useState("");
   const [speaker, setSpeaker] = useState<"interviewer" | "candidate">("interviewer");
   const [provider, setProvider] = useState(loadProviderPreferences);
@@ -229,6 +256,12 @@ function App() {
   const [translationConfig, setTranslationConfig] = useState(loadTranslationPreferences);
   const [showSettings, setShowSettings] = useState(false);
   const [windowPreferences, setWindowPreferences] = useState(loadWindowPreferences);
+  const [manualPhase, setManualPhase] = useState<ManualInterviewPhase>("question");
+  const [manualAppending, setManualAppending] = useState(false);
+  const [manualActionBusy, setManualActionBusy] = useState(false);
+  const [currentQuestion, setCurrentQuestion] = useState("");
+
+  const isMobile = runtimeInfo.mobile;
 
   const latestInterviewer = useMemo(
     () => [...transcript].reverse().find((entry) => entry.speaker === "interviewer"),
@@ -251,6 +284,24 @@ function App() {
       ),
     [draft, interviewerPartial, latestInterviewer, speaker],
   );
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  useEffect(() => {
+    const transcriptList = transcriptListRef.current;
+    if (!transcriptList || !transcriptAutoFollowRef.current) return;
+
+    const frame = requestAnimationFrame(() => {
+      transcriptList.scrollTop = transcriptList.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [partialEntries, transcript]);
+
+  useEffect(() => {
+    partialTranscriptsRef.current = partialTranscripts;
+  }, [partialTranscripts]);
 
   useEffect(() => {
     const unlistenLevel = listen<AudioLevelEvent>("audio-level", (event) => {
@@ -276,18 +327,27 @@ function App() {
     const unlistenAudioError = listen<string>("audio-error", (event) => {
       setListening(false);
       setStatus(`音频错误：${event.payload}`);
+      void invoke("stop_audio_capture").catch(() => undefined);
     });
     const unlistenPartial = listen<TranscriptPartialEvent>("transcript-partial", (event) => {
       const payload = event.payload;
       if (deletedTranscriptIdsRef.current.has(payload.id)) return;
+      const resolvedSpeaker =
+        payload.speaker === "ambient"
+          ? (ambientSpeakerAssignmentsRef.current.get(payload.id) ?? ambientSpeakerRef.current)
+          : payload.speaker;
+      if (payload.speaker === "ambient") {
+        ambientTranscriptIdsRef.current.add(payload.id);
+        ambientSpeakerAssignmentsRef.current.set(payload.id, resolvedSpeaker);
+      }
       const result = detectQuestion(payload.text);
       const timestamp = transcriptStartTimesRef.current.get(payload.id) ?? Date.now();
       transcriptStartTimesRef.current.set(payload.id, timestamp);
       setPartialTranscripts((current) => ({
         ...current,
-        [payload.speaker]: {
+        [resolvedSpeaker]: {
           id: payload.id,
-          speaker: payload.speaker,
+          speaker: resolvedSpeaker,
           text: payload.text,
           language: result.language,
           timestamp,
@@ -295,7 +355,7 @@ function App() {
         },
       }));
       setStatus(
-        payload.speaker === "interviewer"
+        resolvedSpeaker === "interviewer"
           ? "正在识别面试官…"
           : "正在记录我的回答…",
       );
@@ -303,10 +363,18 @@ function App() {
     const unlistenTranscript = listen<TranscriptFinalEvent>("transcript-final", (event) => {
       const payload = event.payload;
       if (deletedTranscriptIdsRef.current.has(payload.id)) return;
+      const resolvedSpeaker =
+        payload.speaker === "ambient"
+          ? (ambientSpeakerAssignmentsRef.current.get(payload.id) ?? ambientSpeakerRef.current)
+          : payload.speaker;
+      if (payload.speaker === "ambient") {
+        ambientTranscriptIdsRef.current.add(payload.id);
+        ambientSpeakerAssignmentsRef.current.set(payload.id, resolvedSpeaker);
+      }
       const result = detectQuestion(payload.text);
       const entry: TranscriptEntry = {
         id: payload.id,
-        speaker: payload.speaker,
+        speaker: resolvedSpeaker,
         text: payload.text,
         language: result.language,
         timestamp: transcriptStartTimesRef.current.get(payload.id) ?? Date.now(),
@@ -314,9 +382,9 @@ function App() {
       };
       transcriptStartTimesRef.current.delete(payload.id);
       setPartialTranscripts((current) => {
-        if (current[payload.speaker]?.id !== payload.id) return current;
+        if (current[resolvedSpeaker]?.id !== payload.id) return current;
         const next = { ...current };
-        delete next[payload.speaker];
+        delete next[resolvedSpeaker];
         return next;
       });
       setTranscript((current) => {
@@ -328,7 +396,7 @@ function App() {
         return next.sort((left, right) => left.timestamp - right.timestamp);
       });
       setStatus(
-        payload.speaker === "candidate"
+        resolvedSpeaker === "candidate"
           ? "已记录我的回答"
           : result.isQuestion
             ? "已识别面试问题"
@@ -350,6 +418,34 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const mobilePreview = new URLSearchParams(window.location.search).has("mobilePreview");
+    if (mobilePreview) {
+      setRuntimeInfo({ platform: "ios", mobile: true, audioCapture: "ambient" });
+      setSttConfig((current) => ({ ...current, mode: "tencentCloud" }));
+      setTranslationConfig((current) =>
+        current.mode === "ollama" ? { ...current, mode: "deepseek" } : current,
+      );
+      setWindowPreferences(DEFAULT_WINDOW_PREFERENCES);
+      setRuntimeReady(true);
+      return;
+    }
+    void invoke<RuntimeInfo>("get_runtime_info")
+      .then((info) => {
+        setRuntimeInfo(info);
+        if (info.mobile) {
+          setSttConfig((current) => ({ ...current, mode: "tencentCloud" }));
+          setTranslationConfig((current) =>
+            current.mode === "ollama" ? { ...current, mode: "deepseek" } : current,
+          );
+          setWindowPreferences(DEFAULT_WINDOW_PREFERENCES);
+        }
+      })
+      .catch((error) => setStatus(`读取运行环境失败：${String(error)}`))
+      .finally(() => setRuntimeReady(true));
+  }, []);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
     void invoke<SecretStatus>("get_secret_status")
       .then(setSecretStatus)
       .catch((error) => setStatus(`读取钥匙串状态失败：${String(error)}`));
@@ -462,6 +558,7 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (!runtimeReady || runtimeInfo.mobile) return;
     void invoke<WindowPosition>("restore_window_preferences", {
       preferences: windowPreferences,
     })
@@ -473,15 +570,16 @@ function App() {
       .catch((error) => setStatus(`窗口设置失败：${String(error)}`));
     // Window preferences are restored once. Later changes use set_window_presentation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [runtimeInfo.mobile, runtimeReady]);
 
   useEffect(() => {
+    if (runtimeInfo.mobile) return;
     document.documentElement.classList.toggle(
       "transparent-mode",
       windowPreferences.alwaysOnTop,
     );
     return () => document.documentElement.classList.remove("transparent-mode");
-  }, [windowPreferences.alwaysOnTop]);
+  }, [runtimeInfo.mobile, windowPreferences.alwaysOnTop]);
 
   async function toggleListening() {
     try {
@@ -494,9 +592,27 @@ function App() {
           setStatus("请先在顶部选择本场面试的回答语言");
           return;
         }
-        await invoke("start_audio_capture", { config: sttConfig });
+        const captureConfig = isMobile
+          ? { ...sttConfig, mode: "tencentCloud" as const }
+          : sttConfig;
+        const started = await invoke<CaptureStarted>("start_audio_capture", {
+          config: captureConfig,
+        });
+        if (started.audioCapture === "ambient") {
+          ambientSpeakerRef.current = "interviewer";
+          ambientSpeakerAssignmentsRef.current.clear();
+          ambientTranscriptIdsRef.current.clear();
+          questionWindowStartRef.current = Date.now();
+          setManualPhase("question");
+          setManualAppending(false);
+          setCurrentQuestion("");
+        }
         setListening(true);
-        setStatus("正在监听面试官和我的麦克风");
+        setStatus(
+          started.audioCapture === "ambient"
+            ? "正在通过 iPhone 麦克风监听面试环境"
+            : "正在监听面试官和我的麦克风",
+        );
       }
     } catch (error) {
       setStatus(`音频错误：${String(error)}`);
@@ -525,6 +641,8 @@ function App() {
   function deleteTranscript(id: string) {
     deletedTranscriptIdsRef.current.add(id);
     transcriptStartTimesRef.current.delete(id);
+    ambientTranscriptIdsRef.current.delete(id);
+    ambientSpeakerAssignmentsRef.current.delete(id);
     setTranscript((current) => current.filter((entry) => entry.id !== id));
     setPartialTranscripts((current) => {
       const next = { ...current };
@@ -554,6 +672,7 @@ function App() {
   }
 
   function clearTranscript() {
+    transcriptAutoFollowRef.current = true;
     setTranscript((current) => {
       current.forEach((entry) => deletedTranscriptIdsRef.current.add(entry.id));
       return [];
@@ -566,6 +685,11 @@ function App() {
     });
     transcriptStartTimesRef.current.clear();
     translationRequestsRef.current.clear();
+    ambientTranscriptIdsRef.current.clear();
+    ambientSpeakerAssignmentsRef.current.clear();
+    questionWindowStartRef.current = Date.now();
+    setCurrentQuestion("");
+    setManualAppending(false);
     setStatus("转写记录已清空");
   }
 
@@ -610,7 +734,7 @@ function App() {
         ...current,
         tencent: { ...current.tencent, secretKey: "" },
       }));
-      setStatus("密钥已安全保存到 macOS 钥匙串");
+      setStatus("密钥已安全保存到系统钥匙串");
     } catch (error) {
       setStatus(`保存密钥失败：${String(error)}`);
     }
@@ -618,18 +742,118 @@ function App() {
 
   async function clearStoredSecret(kind: SecretKind) {
     const label = kind === "deepseekApiKey" ? "DeepSeek API Key" : "腾讯云 SecretKey";
-    if (!window.confirm(`确定从 macOS 钥匙串删除 ${label}？`)) return;
+    if (!window.confirm(`确定从系统钥匙串删除 ${label}？`)) return;
     try {
       await invoke("delete_secret", { kind });
       setSecretStatus((current) => ({ ...current, [kind]: false }));
-      setStatus(`${label} 已从 macOS 钥匙串删除`);
+      setStatus(`${label} 已从系统钥匙串删除`);
     } catch (error) {
       setStatus(`删除密钥失败：${String(error)}`);
     }
   }
 
-  async function askAi() {
+  function collectQuestionTextSince(startedAt: number): string {
+    const entriesById = new Map<string, TranscriptEntry>();
+    for (const entry of [
+      ...transcriptRef.current,
+      ...Object.values(partialTranscriptsRef.current).filter(
+        (entry): entry is TranscriptEntry => Boolean(entry),
+      ),
+    ]) {
+      if (entry.speaker !== "interviewer" || entry.timestamp < startedAt) continue;
+      const existing = entriesById.get(entry.id);
+      if (!existing || entry.isFinal) entriesById.set(entry.id, entry);
+    }
+    return [...entriesById.values()]
+      .sort((left, right) => left.timestamp - right.timestamp)
+      .map((entry) => entry.text.trim())
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+  }
+
+  function startQuestionAppend() {
+    if (!listening || !currentQuestion || manualActionBusy) return;
+    const rollbackAt = Date.now() - QUESTION_APPEND_ROLLBACK_MS;
+    ambientSpeakerRef.current = "interviewer";
+    questionWindowStartRef.current = rollbackAt;
+
+    for (const entry of [
+      ...transcriptRef.current,
+      ...Object.values(partialTranscriptsRef.current).filter(
+        (item): item is TranscriptEntry => Boolean(item),
+      ),
+    ]) {
+      if (entry.timestamp >= rollbackAt && ambientTranscriptIdsRef.current.has(entry.id)) {
+        ambientSpeakerAssignmentsRef.current.set(entry.id, "interviewer");
+      }
+    }
+
+    setTranscript((current) => {
+      const next = current.map((entry) =>
+        entry.timestamp >= rollbackAt && ambientTranscriptIdsRef.current.has(entry.id)
+          ? { ...entry, speaker: "interviewer" as const }
+          : entry,
+      );
+      transcriptRef.current = next;
+      return next;
+    });
+    setPartialTranscripts((current) => {
+      const next: Partial<Record<TranscriptEntry["speaker"], TranscriptEntry>> = {};
+      for (const entry of Object.values(current)) {
+        if (!entry) continue;
+        const reassigned =
+          entry.timestamp >= rollbackAt && ambientTranscriptIdsRef.current.has(entry.id)
+            ? { ...entry, speaker: "interviewer" as const }
+            : entry;
+        next[reassigned.speaker] = reassigned;
+      }
+      partialTranscriptsRef.current = next;
+      return next;
+    });
+    setManualPhase("question");
+    setManualAppending(true);
+    setStatus("正在追加面试官的问题；补充结束后点击“问题结束”");
+  }
+
+  function finishCandidateAnswer() {
+    if (!listening || manualActionBusy) return;
+    ambientSpeakerRef.current = "interviewer";
+    questionWindowStartRef.current = Date.now();
+    setManualPhase("question");
+    setManualAppending(false);
+    setCurrentQuestion("");
+    setStatus("回答已结束，正在监听下一道问题");
+  }
+
+  async function finishQuestion() {
+    if (!listening || manualActionBusy) return;
+    setManualActionBusy(true);
+    setStatus("正在收取问题尾音…");
+    await new Promise<void>((resolve) => window.setTimeout(resolve, QUESTION_TAIL_DELAY_MS));
+
+    const addedText = collectQuestionTextSince(questionWindowStartRef.current);
+    const question = manualAppending
+      ? [currentQuestion, addedText && `补充：${addedText}`].filter(Boolean).join("\n")
+      : addedText;
+    if (!question.trim()) {
+      setManualActionBusy(false);
+      setStatus("还没有识别到本轮面试官问题，请继续监听后再点击");
+      return;
+    }
+
+    setCurrentQuestion(question);
+    setManualAppending(false);
+    setManualPhase("answer");
+    ambientSpeakerRef.current = "candidate";
+    setManualActionBusy(false);
+    await askAi(question);
+  }
+
+  async function askAi(questionOverride?: string) {
     const question =
+      questionOverride?.trim() ||
+      currentQuestion.trim() ||
       interviewerPartial?.text.trim() ||
       latestInterviewer?.text.trim() ||
       (speaker === "interviewer" ? draft.trim() : "");
@@ -660,7 +884,7 @@ function App() {
         messages: buildInterviewMessages(
           question,
           answerLanguage,
-          transcript,
+          transcriptRef.current,
           profile,
           jobDescription,
           answerHints.trim(),
@@ -678,16 +902,23 @@ function App() {
   const meterWidths = {
     interviewer: `${Math.min(100, Math.max(2, audioLevels.interviewer.rms * 260))}%`,
     candidate: `${Math.min(100, Math.max(2, audioLevels.candidate.rms * 260))}%`,
+    ambient: `${Math.min(100, Math.max(2, audioLevels.ambient.rms * 260))}%`,
   };
 
   return (
-    <main className={`app-shell ${windowPreferences.alwaysOnTop ? "focus-mode" : ""}`}>
+    <main
+      className={`app-shell ${windowPreferences.alwaysOnTop ? "focus-mode" : ""} ${
+        isMobile ? "mobile-runtime" : ""
+      }`}
+    >
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark">IC</span>
           <div>
             <h1>Interview Copilot</h1>
-            <p>中英实时面试教练 · macOS prototype</p>
+            <p>
+              中英实时面试教练 · {isMobile ? "iPhone 环境监听" : "macOS 双通道"}
+            </p>
           </div>
         </div>
         <div className="topbar-actions">
@@ -714,32 +945,36 @@ function App() {
               <option value="en">English answer</option>
             </select>
           </label>
-          <button
-            className={`ghost-button ${windowPreferences.alwaysOnTop ? "selected" : ""}`}
-            title="保持在其他窗口上方，并进入仅保留文字的透视模式"
-            onClick={() =>
-              updateWindowPresentation(
-                { ...windowPreferences, alwaysOnTop: !windowPreferences.alwaysOnTop },
-                windowPreferences.alwaysOnTop
-                  ? "已取消置顶并恢复界面背景"
-                  : "窗口已置顶并进入透视模式",
-              )
-            }
-          >
-            {windowPreferences.alwaysOnTop ? "已置顶 · 透视" : "置顶透视"}
-          </button>
-          <button
-            className={`ghost-button ${windowPreferences.locked ? "selected" : ""}`}
-            title="记住当前位置并阻止窗口被意外拖动"
-            onClick={() =>
-              updateWindowPresentation(
-                { ...windowPreferences, locked: !windowPreferences.locked },
-                windowPreferences.locked ? "窗口位置已解锁" : "窗口位置已锁定并保存",
-              )
-            }
-          >
-            {windowPreferences.locked ? "解除锁定" : "锁定位置"}
-          </button>
+          {!isMobile && (
+            <>
+              <button
+                className={`ghost-button ${windowPreferences.alwaysOnTop ? "selected" : ""}`}
+                title="保持在其他窗口上方，并进入仅保留文字的透视模式"
+                onClick={() =>
+                  updateWindowPresentation(
+                    { ...windowPreferences, alwaysOnTop: !windowPreferences.alwaysOnTop },
+                    windowPreferences.alwaysOnTop
+                      ? "已取消置顶并恢复界面背景"
+                      : "窗口已置顶并进入透视模式",
+                  )
+                }
+              >
+                {windowPreferences.alwaysOnTop ? "已置顶 · 透视" : "置顶透视"}
+              </button>
+              <button
+                className={`ghost-button ${windowPreferences.locked ? "selected" : ""}`}
+                title="记住当前位置并阻止窗口被意外拖动"
+                onClick={() =>
+                  updateWindowPresentation(
+                    { ...windowPreferences, locked: !windowPreferences.locked },
+                    windowPreferences.locked ? "窗口位置已解锁" : "窗口位置已锁定并保存",
+                  )
+                }
+              >
+                {windowPreferences.locked ? "解除锁定" : "锁定位置"}
+              </button>
+            </>
+          )}
           <button className="ghost-button" onClick={() => setShowSettings((value) => !value)}>
             设置
           </button>
@@ -753,26 +988,36 @@ function App() {
               <span className="eyebrow">SETTINGS</span>
               <h2>语音识别与回答 Provider</h2>
             </div>
-            <span className="privacy-note">敏感密钥加密保存在 macOS 钥匙串，不提供明文查看</span>
+            <span className="privacy-note">敏感密钥保存在系统钥匙串，不提供明文查看</span>
+            {isMobile && (
+              <button className="ghost-button" onClick={() => setShowSettings(false)}>
+                完成
+              </button>
+            )}
           </div>
           <div className="settings-grid">
             <label className="wide-field">
               语音识别模式
               <select
                 value={sttConfig.mode}
-                disabled={listening}
+                disabled={listening || isMobile}
                 onChange={(event) =>
                   setSttConfig({ ...sttConfig, mode: event.target.value as SttConfig["mode"] })
                 }
               >
-                <option value="localFast">本地快速 · Zipformer + SenseVoice</option>
-                <option value="localAccurate">本地高精度 · Zipformer + Qwen3-ASR 0.6B</option>
+                {!isMobile && (
+                  <>
+                    <option value="localFast">本地快速 · Zipformer + SenseVoice</option>
+                    <option value="localAccurate">本地高精度 · Zipformer + Qwen3-ASR 0.6B</option>
+                  </>
+                )}
                 <option value="tencentCloud">腾讯云高精度 · ASR 大模型 2.0</option>
               </select>
               <small className="field-note">
                 {sttConfig.mode === "localFast" && "完全离线，资源占用最低。"}
                 {sttConfig.mode === "localAccurate" && "完全离线，准确率优先，会占用更多内存。"}
                 {sttConfig.mode === "tencentCloud" && "实时上传音频到腾讯云，依赖网络并可能产生费用。"}
+                {isMobile && " iPhone 首版固定使用腾讯云识别环境声音。"}
               </small>
             </label>
             <label>
@@ -848,7 +1093,7 @@ function App() {
                     }
                   >
                     <option value="deepseek">DeepSeek 云端翻译</option>
-                    <option value="ollama">Ollama 本地翻译</option>
+                    {!isMobile && <option value="ollama">Ollama 本地翻译</option>}
                   </select>
                 </label>
                 {translationConfig.mode === "deepseek" ? (
@@ -1016,38 +1261,71 @@ function App() {
           </div>
 
           <div className="audio-sources">
-            <div className="audio-source">
-              <div>
-                <strong>面试官 · 系统声音</strong>
-                <small>
-                  {audioLevels.interviewer.sampleRate
-                    ? `${audioLevels.interviewer.sampleRate} Hz · peak ${audioLevels.interviewer.peak.toFixed(2)}`
-                    : "等待 Core Audio Tap"}
-                </small>
+            {isMobile ? (
+              <div className="audio-source ambient-source">
+                <div>
+                  <strong>
+                    环境麦克风 · {manualPhase === "question" ? "面试官" : "我的回答"}
+                  </strong>
+                  <small>
+                    {audioLevels.ambient.sampleRate
+                      ? `${audioLevels.ambient.sampleRate} Hz · peak ${audioLevels.ambient.peak.toFixed(2)}`
+                      : "等待 iPhone 麦克风权限"}
+                  </small>
+                </div>
+                <div className="audio-meter" aria-label="环境音频电平">
+                  <span style={{ width: meterWidths.ambient }} />
+                </div>
               </div>
-              <div className="audio-meter" aria-label="系统音频电平">
-                <span style={{ width: meterWidths.interviewer }} />
-              </div>
-            </div>
-            <div className="audio-source candidate-source">
-              <div>
-                <strong>我 · 麦克风</strong>
-                <small>
-                  {audioLevels.candidate.sampleRate
-                    ? `${audioLevels.candidate.sampleRate} Hz · peak ${audioLevels.candidate.peak.toFixed(2)}`
-                    : "等待麦克风权限"}
-                </small>
-              </div>
-              <div className="audio-meter" aria-label="麦克风输入电平">
-                <span style={{ width: meterWidths.candidate }} />
-              </div>
-            </div>
+            ) : (
+              <>
+                <div className="audio-source">
+                  <div>
+                    <strong>面试官 · 系统声音</strong>
+                    <small>
+                      {audioLevels.interviewer.sampleRate
+                        ? `${audioLevels.interviewer.sampleRate} Hz · peak ${audioLevels.interviewer.peak.toFixed(2)}`
+                        : "等待 Core Audio Tap"}
+                    </small>
+                  </div>
+                  <div className="audio-meter" aria-label="系统音频电平">
+                    <span style={{ width: meterWidths.interviewer }} />
+                  </div>
+                </div>
+                <div className="audio-source candidate-source">
+                  <div>
+                    <strong>我 · 麦克风</strong>
+                    <small>
+                      {audioLevels.candidate.sampleRate
+                        ? `${audioLevels.candidate.sampleRate} Hz · peak ${audioLevels.candidate.peak.toFixed(2)}`
+                        : "等待麦克风权限"}
+                    </small>
+                  </div>
+                  <div className="audio-meter" aria-label="麦克风输入电平">
+                    <span style={{ width: meterWidths.candidate }} />
+                  </div>
+                </div>
+              </>
+            )}
           </div>
 
-          <div className="transcript-list">
+          <div
+            className="transcript-list"
+            ref={transcriptListRef}
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              const distanceFromBottom =
+                element.scrollHeight - element.scrollTop - element.clientHeight;
+              transcriptAutoFollowRef.current = distanceFromBottom < 72;
+            }}
+          >
             {transcript.length === 0 && partialEntries.length === 0 ? (
               <div className="empty-state">
-                <p>系统声音会标记为“面试官”，麦克风会标记为“我”。建议佩戴耳机，避免扬声器声音再次进入麦克风。</p>
+                <p>
+                  {isMobile
+                    ? "请将 iPhone 横放在电脑扬声器附近。程序持续监听环境声，由底部按钮标记面试官问题与我的回答。"
+                    : "系统声音会标记为“面试官”，麦克风会标记为“我”。建议佩戴耳机，避免扬声器声音再次进入麦克风。"}
+                </p>
               </div>
             ) : (
               <>
@@ -1135,7 +1413,11 @@ function App() {
               <span className="eyebrow">ANSWER COACH</span>
               <h2>回答建议</h2>
             </div>
-            <button className="ask-button" disabled={Boolean(activeRequestId)} onClick={askAi}>
+            <button
+              className="ask-button"
+              disabled={Boolean(activeRequestId)}
+              onClick={() => void askAi()}
+            >
               {activeRequestId ? "生成中…" : "生成建议"}
             </button>
           </div>
@@ -1199,6 +1481,46 @@ function App() {
           </div>
         </article>
       </section>
+
+      {isMobile && (
+        <section className={`manual-controls ${manualPhase} ${manualAppending ? "appending" : ""}`}>
+          <div className="manual-state">
+            <span>{manualPhase === "question" ? "正在听题" : "正在记录我的回答"}</span>
+            <strong>
+              {manualAppending
+                ? "面试官正在补充问题"
+                : manualPhase === "question"
+                  ? "说完后点击“问题结束”"
+                  : "若面试官补充请点左侧；答完请点右侧"}
+            </strong>
+          </div>
+          <button
+            className="append-question-button"
+            disabled={!listening || !currentQuestion || manualActionBusy || manualAppending}
+            onClick={startQuestionAppend}
+          >
+            <span>问题追加</span>
+            <small>回溯最近 3.5 秒</small>
+          </button>
+          <button
+            className="phase-action-button"
+            disabled={!listening || manualActionBusy}
+            onClick={() => {
+              if (manualPhase === "question") void finishQuestion();
+              else finishCandidateAnswer();
+            }}
+          >
+            <span>
+              {manualActionBusy
+                ? "正在收尾…"
+                : manualPhase === "question"
+                  ? "问题结束"
+                  : "回答结束"}
+            </span>
+            <small>{manualPhase === "question" ? "生成回答建议" : "开始听下一题"}</small>
+          </button>
+        </section>
+      )}
     </main>
   );
 }

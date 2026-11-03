@@ -26,6 +26,28 @@ The two mono Float32 PCM streams have independent queues, recognizers and level 
 
 Translation is deliberately separate from answer generation. Each finalized English or mixed interviewer entry has its own non-streaming translation request and status, so translation completion or failure cannot overwrite an active answer stream. DeepSeek reuses the configured provider and Keychain credential; Ollama uses its native local `POST /api/chat` endpoint.
 
+## iPhone companion MVP
+
+```text
+laptop speakers + candidate voice
+              |
+              v
+iPhone AVAudioEngine ambient microphone tap
+              |
+              v (Float32 FFI)
+Rust bounded audio queue -> Tencent ASR V2 (single session)
+              |
+              v
+manual role state: interviewer <-> candidate
+              |
+     question end / question append
+              |
+              v
+DeepSeek answer stream + full dialogue context
+```
+
+The iOS path intentionally uses one microphone and one cloud recognizer. Ambient transcript IDs receive a stable role when their first partial event arrives. Manual controls change the role for future IDs; “question append” additionally rolls recent ambient IDs back to interviewer so a late tap does not lose the beginning of a supplement. The desktop path remains dual-channel and does not use this state machine.
+
 ## STT boundary
 
 The audio helper emits raw PCM. Each source is routed to the selected provider with a fixed role:

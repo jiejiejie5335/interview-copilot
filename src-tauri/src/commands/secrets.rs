@@ -55,7 +55,7 @@ pub struct SecretStatus {
     tencent_secret_key: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) fn load_secret(kind: SecretKind) -> Result<Option<String>, String> {
     use security_framework::passwords::get_generic_password;
 
@@ -65,38 +65,38 @@ pub(crate) fn load_secret(kind: SecretKind) -> Result<Option<String>, String> {
 
     match get_generic_password(KEYCHAIN_SERVICE, kind.account()) {
         Ok(value) => {
-            let value = String::from_utf8(value)
-                .map_err(|_| "钥匙串中的密钥不是有效文本".to_string())?;
+            let value =
+                String::from_utf8(value).map_err(|_| "钥匙串中的密钥不是有效文本".to_string())?;
             cache_secret(kind, Some(&value))?;
             Ok(Some(value))
         }
         Err(error) if error.code() == KEYCHAIN_ITEM_NOT_FOUND => Ok(None),
-        Err(error) => Err(format!("无法读取 macOS 钥匙串：{error}")),
+        Err(error) => Err(format!("无法读取系统钥匙串：{error}")),
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub(crate) fn load_secret(_kind: SecretKind) -> Result<Option<String>, String> {
-    Err("当前版本仅支持使用 macOS 钥匙串保存密钥".to_string())
+    Err("当前平台暂不支持系统钥匙串".to_string())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn store_secret(kind: SecretKind, value: &str) -> Result<(), String> {
     security_framework::passwords::set_generic_password(
         KEYCHAIN_SERVICE,
         kind.account(),
         value.as_bytes(),
     )
-    .map_err(|error| format!("无法写入 macOS 钥匙串：{error}"))?;
+    .map_err(|error| format!("无法写入系统钥匙串：{error}"))?;
     cache_secret(kind, Some(value))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn store_secret(_kind: SecretKind, _value: &str) -> Result<(), String> {
-    Err("当前版本仅支持使用 macOS 钥匙串保存密钥".to_string())
+    Err("当前平台暂不支持系统钥匙串".to_string())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn remove_secret(kind: SecretKind) -> Result<(), String> {
     let result = match security_framework::passwords::delete_generic_password(
         KEYCHAIN_SERVICE,
@@ -104,15 +104,15 @@ fn remove_secret(kind: SecretKind) -> Result<(), String> {
     ) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == KEYCHAIN_ITEM_NOT_FOUND => Ok(()),
-        Err(error) => Err(format!("无法从 macOS 钥匙串删除密钥：{error}")),
+        Err(error) => Err(format!("无法从系统钥匙串删除密钥：{error}")),
     };
     result?;
     cache_secret(kind, None)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn remove_secret(_kind: SecretKind) -> Result<(), String> {
-    Err("当前版本仅支持使用 macOS 钥匙串保存密钥".to_string())
+    Err("当前平台暂不支持系统钥匙串".to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -135,9 +135,16 @@ fn secret_exists(kind: SecretKind) -> Result<bool, String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "ios")]
+fn secret_exists(kind: SecretKind) -> Result<bool, String> {
+    // iOS generic-password items created here do not use biometric access
+    // control, so this lookup does not display an authentication prompt.
+    load_secret(kind).map(|value| value.is_some())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 fn secret_exists(_kind: SecretKind) -> Result<bool, String> {
-    Err("当前版本仅支持使用 macOS 钥匙串保存密钥".to_string())
+    Err("当前平台暂不支持系统钥匙串".to_string())
 }
 
 #[tauri::command]

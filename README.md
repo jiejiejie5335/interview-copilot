@@ -1,6 +1,6 @@
 # Interview Copilot
 
-本地优先的 macOS 技术面试练习与经授权实时辅助工具。当前阶段聚焦：
+本地优先的 macOS / iPhone 技术面试练习与经授权实时辅助工具。当前阶段聚焦：
 
 - Tauri 2 + React 桌面壳
 - macOS 系统音频与麦克风双通道采集（原生 Swift helper）
@@ -9,6 +9,7 @@
 - 可关闭的英文转中文翻译：DeepSeek 云端或 Ollama 本地
 - 可切换 STT：SenseVoice 本地快速、Qwen3-ASR 本地高精度、腾讯云 ASR 2.0
 - 可替换的 RAG 接口
+- iPhone 横屏环境监听与手动问题边界（`feature/ios-manual-companion`）
 
 > 仅应在参与者知情并允许录音、转写和 AI 辅助的场景中使用。项目不实现屏幕共享规避或应用伪装。
 
@@ -55,6 +56,46 @@ DeepSeek API Key 和腾讯云 SecretKey 均保存在 macOS 钥匙串中，界面
 
 应用启动时只查询钥匙串条目是否存在，不读取密钥内容，因此不会因为显示“已保存”而弹出授权窗口。密钥在第一次实际调用对应服务时读取，并缓存在当前应用进程内。开发模式的二进制使用临时签名；重新编译后 macOS 可能在第一次读取时重新询问一次，稳定构建且二进制未变化时不会反复询问。
 
+## iPhone 横屏环境监听 MVP
+
+iPhone 版本作为放在电脑旁边的伴随终端：电脑继续运行视频面试，iPhone 麦克风持续采集电脑扬声器和候选人的现场声音。首版固定使用腾讯云实时 ASR，不在手机上加载桌面端的大型本地模型。
+
+底部控制区采用手动角色边界：
+
+- `问题结束`：额外收取 450 ms 尾音，结束当前问题并立即请求回答建议；之后的环境语音标记为“我”。
+- `问题追加`：将最近 3.5 秒环境转写回溯为面试官内容，并继续追加；再次点击“问题结束”后刷新回答建议。
+- `回答结束`：完成候选人回答，下一段环境语音重新标记为面试官的新问题。
+
+音频由本地 Tauri Swift 插件中的 `AVAudioEngine` 采集，经 FFI 直接进入 Rust 的有界队列和现有腾讯云 WebSocket，不把 PCM 发送到 WebView。监听期间会阻止 iPhone 自动锁屏；停止监听后恢复系统锁屏设置。DeepSeek API Key 和腾讯云 SecretKey 使用 iOS Keychain 保存。
+
+使用时请让电脑通过扬声器播放面试声音，并将 iPhone 横放在扬声器附近。完全封闭的耳机不会把面试官声音播放到环境中，因此不适用于这个模式。
+
+### iOS 开发环境
+
+iOS 构建必须安装完整 Xcode，只有 Xcode Command Line Tools 不够。首次配置：
+
+```bash
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+rustup target add aarch64-apple-ios x86_64-apple-ios aarch64-apple-ios-sim
+brew install cocoapods xcodegen
+npm install
+npm run tauri ios init -- --ci
+```
+
+然后在 `src-tauri/tauri.ios.conf.json` 的 `bundle.iOS.developmentTeam` 中填写 Apple Developer Team ID，或者在当前终端设置 `APPLE_DEVELOPMENT_TEAM`。连接并信任 iPhone 后运行：
+
+```bash
+npm run tauri ios dev
+```
+
+首次开始监听时允许麦克风权限。横屏界面也可以先在桌面开发窗口预览：
+
+```text
+http://localhost:1420/?mobilePreview=1
+```
+
+当前开发机若缺少完整 Xcode、`xcodegen` 或 CocoaPods，`tauri ios init` 会停止；安装上述依赖后重新执行即可，不需要删除现有代码。
+
 ### 英语面试中文翻译
 
 在“设置”中打开“英语面试实时中文翻译”，然后选择：
@@ -74,5 +115,6 @@ ollama pull qwen2.5:3b
 - `src-tauri/src/commands/provider.rs`：OpenAI-compatible / DeepSeek SSE 流式适配
 - `src-tauri/audio-helper/SystemAudioTap.swift`：macOS 系统音频 Process Tap 与默认麦克风采集
 - `src-tauri/src/audio/macos.rs`：Float32 PCM 音频 helper 生命周期
+- `plugins/`：iOS `AVAudioEngine` 环境麦克风 Tauri 插件
 - `src-tauri/src/stt/`：sherpa-onnx 流式识别、endpoint 定稿与音频回归工具
 - `docs/ARCHITECTURE.md`：组件边界和下一阶段 STT 接入点

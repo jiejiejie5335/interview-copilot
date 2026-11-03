@@ -16,25 +16,15 @@ use sherpa_onnx::{
 use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 
+use super::{
+    text::{hotword_terms, normalize_hotword_aliases, parse_hotwords, HotwordEntry},
+    AudioChunk, RefinementModel,
+};
+
 static TRANSCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
-const ONLINE_MODEL_DIRECTORY: &str =
-    "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20";
-const REFINEMENT_MODEL_DIRECTORY: &str =
-    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
+const ONLINE_MODEL_DIRECTORY: &str = "sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20";
+const REFINEMENT_MODEL_DIRECTORY: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 const QWEN_MODEL_DIRECTORY: &str = "sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25";
-const DEFAULT_HOTWORDS: &str = "Golang=高粱|高亮|勾烂|狗浪|国王|够浪|GO\nGMP=鸡一|鸡安屁|鸡艾姆屁|积木P|节目P|G M P\ngoroutine=固若听|狗肉听\nchannel\nscheduler\ncontext\nMySQL\nPostgreSQL\nRedis\nKafka\nRabbitMQ\nDocker\nKubernetes\ngRPC\nHTTP\nHTTPS\nTCP\nJVM\nJava\nSpring Boot\nPython\nRust\nReact\nTypeScript\nNode JS\n微服务\n高并发\n数据库\n索引\n事务\nMVCC\n分布式\nCAP\nRaft\nPaxos\n";
-
-pub struct AudioChunk {
-    pub samples: Vec<f32>,
-    pub sample_rate: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum RefinementModel {
-    SenseVoice,
-    Qwen3,
-}
-
 impl RefinementModel {
     fn label(self) -> &'static str {
         match self {
@@ -49,12 +39,6 @@ struct RefinementJob {
     samples: Vec<f32>,
     sample_rate: u32,
     fast_text: String,
-}
-
-#[derive(Clone, Debug)]
-struct HotwordEntry {
-    canonical: String,
-    aliases: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -92,7 +76,10 @@ fn online_model_files() -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
 
 fn refinement_model_files() -> (PathBuf, PathBuf) {
     let directory = model_directory(REFINEMENT_MODEL_DIRECTORY);
-    (directory.join("model.int8.onnx"), directory.join("tokens.txt"))
+    (
+        directory.join("model.int8.onnx"),
+        directory.join("tokens.txt"),
+    )
 }
 
 fn qwen_model_files() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -155,104 +142,6 @@ fn emit_status(app: &AppHandle, state: &'static str, message: impl Into<String>)
     );
 }
 
-fn parse_hotwords(extra_hotwords: &str) -> Vec<HotwordEntry> {
-    let mut entries = Vec::<HotwordEntry>::new();
-    for line in format!("{DEFAULT_HOTWORDS}\n{extra_hotwords}").lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (canonical, aliases) = line
-            .split_once('=')
-            .map(|(canonical, aliases)| {
-                (
-                    canonical.trim(),
-                    aliases
-                        .split('|')
-                        .map(str::trim)
-                        .filter(|alias| !alias.is_empty())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .unwrap_or((line, Vec::new()));
-        if canonical.is_empty() {
-            continue;
-        }
-        if let Some(existing) = entries
-            .iter_mut()
-            .find(|entry| entry.canonical.eq_ignore_ascii_case(canonical))
-        {
-            for alias in aliases {
-                if !existing.aliases.iter().any(|item| item == &alias) {
-                    existing.aliases.push(alias);
-                }
-            }
-        } else {
-            entries.push(HotwordEntry {
-                canonical: canonical.to_string(),
-                aliases,
-            });
-        }
-    }
-    entries
-}
-
-pub fn hotword_terms(extra_hotwords: &str) -> Vec<String> {
-    parse_hotwords(extra_hotwords)
-        .into_iter()
-        .map(|entry| entry.canonical)
-        .collect()
-}
-
-fn replace_ascii_word(text: &str, alias: &str, replacement: &str) -> String {
-    let lowered = text.to_ascii_lowercase();
-    let needle = alias.to_ascii_lowercase();
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while let Some(relative) = lowered[cursor..].find(&needle) {
-        let start = cursor + relative;
-        let end = start + needle.len();
-        let before_is_word = start > 0
-            && text.as_bytes()[start - 1].is_ascii_alphanumeric();
-        let after_is_word = end < text.len() && text.as_bytes()[end].is_ascii_alphanumeric();
-        if before_is_word || after_is_word {
-            output.push_str(&text[cursor..end]);
-        } else {
-            output.push_str(&text[cursor..start]);
-            output.push_str(replacement);
-        }
-        cursor = end;
-    }
-    output.push_str(&text[cursor..]);
-    output
-}
-
-fn normalize_hotword_aliases(text: &str, entries: &[HotwordEntry]) -> (String, usize) {
-    let mut normalized = text.to_string();
-    for entry in entries {
-        let mut aliases = entry.aliases.clone();
-        aliases.sort_by_key(|alias| std::cmp::Reverse(alias.chars().count()));
-        for alias in aliases {
-            normalized = if alias.is_ascii() {
-                replace_ascii_word(&normalized, &alias, &entry.canonical)
-            } else {
-                normalized.replace(&alias, &entry.canonical)
-            };
-        }
-    }
-    let lowered = normalized.to_ascii_lowercase();
-    let hits = entries
-        .iter()
-        .filter(|entry| lowered.contains(&entry.canonical.to_ascii_lowercase()))
-        .count();
-    (normalized, hits)
-}
-
-pub fn normalize_transcript(text: &str, extra_hotwords: &str) -> String {
-    normalize_hotword_aliases(text, &parse_hotwords(extra_hotwords)).0
-}
-
 fn select_final_text(fast: &str, refined: &str, entries: &[HotwordEntry]) -> String {
     let (fast, fast_hits) = normalize_hotword_aliases(fast, entries);
     let (refined, refined_hits) = normalize_hotword_aliases(refined, entries);
@@ -297,12 +186,14 @@ fn create_recognizer(extra_hotwords: &str) -> Result<OnlineRecognizer> {
 fn canonical_hotwords(extra_hotwords: &str) -> String {
     let mut prioritized = extra_hotwords
         .lines()
-        .filter_map(|line| line.trim().split_once('=').map_or_else(
-            || (!line.trim().is_empty()).then(|| line.trim().to_string()),
-            |(canonical, _)| {
-                (!canonical.trim().is_empty()).then(|| canonical.trim().to_string())
-            },
-        ))
+        .filter_map(|line| {
+            line.trim().split_once('=').map_or_else(
+                || (!line.trim().is_empty()).then(|| line.trim().to_string()),
+                |(canonical, _)| {
+                    (!canonical.trim().is_empty()).then(|| canonical.trim().to_string())
+                },
+            )
+        })
         .collect::<Vec<_>>();
     for term in hotword_terms(extra_hotwords) {
         if !prioritized
@@ -312,7 +203,11 @@ fn canonical_hotwords(extra_hotwords: &str) -> String {
             prioritized.push(term);
         }
     }
-    prioritized.into_iter().take(16).collect::<Vec<_>>().join(",")
+    prioritized
+        .into_iter()
+        .take(16)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn create_refinement_recognizer(
@@ -453,7 +348,11 @@ fn run_refinement_worker(
     refinement_model: RefinementModel,
     speaker: &'static str,
 ) {
-    let speaker_label = if speaker == "interviewer" { "面试官" } else { "我的回答" };
+    let speaker_label = if speaker == "interviewer" {
+        "面试官"
+    } else {
+        "我的回答"
+    };
     let model_label = refinement_model.label();
     emit_status(
         &app,
@@ -466,14 +365,7 @@ fn run_refinement_worker(
             emit_status(&app, "error", error.to_string());
             while let Ok(job) = receiver.recv() {
                 let fallback = normalize_hotword_aliases(&job.fast_text, &hotword_entries).0;
-                emit_transcript(
-                    &app,
-                    "transcript-final",
-                    &job.id,
-                    fallback,
-                    speaker,
-                    true,
-                );
+                emit_transcript(&app, "transcript-final", &job.id, fallback, speaker, true);
             }
             return;
         }
@@ -486,24 +378,13 @@ fn run_refinement_worker(
 
     while let Ok(job) = receiver.recv() {
         let started = Instant::now();
-        let refined = refine_with_recognizer(
-            &recognizer,
-            &job.samples,
-            job.sample_rate as i32,
-        );
+        let refined = refine_with_recognizer(&recognizer, &job.samples, job.sample_rate as i32);
         let final_text = if is_likely_hallucination(&refined) {
             normalize_hotword_aliases(&job.fast_text, &hotword_entries).0
         } else {
             select_final_text(&job.fast_text, &refined, &hotword_entries)
         };
-        emit_transcript(
-            &app,
-            "transcript-final",
-            &job.id,
-            final_text,
-            speaker,
-            true,
-        );
+        emit_transcript(&app, "transcript-final", &job.id, final_text, speaker, true);
         emit_status(
             &app,
             "listening",
@@ -559,7 +440,11 @@ pub fn run_streaming_worker(
     refinement_model: RefinementModel,
     speaker: &'static str,
 ) {
-    let speaker_label = if speaker == "interviewer" { "面试官" } else { "我的回答" };
+    let speaker_label = if speaker == "interviewer" {
+        "面试官"
+    } else {
+        "我的回答"
+    };
     let hotword_entries = parse_hotwords(&extra_hotwords);
     emit_status(
         &app,
@@ -595,11 +480,7 @@ pub fn run_streaming_worker(
     let mut last_partial = String::new();
     let mut last_sample_rate = 16_000_u32;
     let mut utterance_audio = Vec::<f32>::new();
-    emit_status(
-        &app,
-        "listening",
-        format!("{speaker_label}流式识别已就绪"),
-    );
+    emit_status(&app, "listening", format!("{speaker_label}流式识别已就绪"));
 
     while let Some(chunk) = receiver.blocking_recv() {
         last_sample_rate = chunk.sample_rate;
@@ -680,8 +561,8 @@ pub fn run_streaming_worker(
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_hotwords, is_likely_hallucination, normalize_hotword_aliases, normalized_key,
-        parse_hotwords, replace_ascii_word, select_final_text,
+        canonical_hotwords, is_likely_hallucination, normalized_key, parse_hotwords,
+        select_final_text,
     };
 
     #[test]
@@ -698,20 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_common_technical_term_misrecognitions() {
-        let entries = parse_hotwords("");
-        let (text, hits) = normalize_hotword_aliases("请介绍一下高粱的鸡一模型", &entries);
-        assert_eq!(text, "请介绍一下Golang的GMP模型");
-        assert_eq!(hits, 2);
-    }
-
-    #[test]
-    fn replaces_ascii_aliases_only_at_word_boundaries() {
-        assert_eq!(replace_ascii_word("GO GMP", "GO", "Golang"), "Golang GMP");
-        assert_eq!(replace_ascii_word("Golang", "GO", "Golang"), "Golang");
-    }
-
-    #[test]
     fn keeps_fast_candidate_when_it_preserves_more_hotwords() {
         let entries = parse_hotwords("");
         assert_eq!(
@@ -722,18 +589,6 @@ mod tests {
             ),
             "请介绍一下Golang的GMP模型"
         );
-    }
-
-    #[test]
-    fn merges_duplicate_hotword_definitions() {
-        let entries = parse_hotwords("Golang=够蓝\nGolang");
-        let golang = entries
-            .iter()
-            .filter(|entry| entry.canonical == "Golang")
-            .collect::<Vec<_>>();
-        assert_eq!(golang.len(), 1);
-        assert!(golang[0].aliases.iter().any(|alias| alias == "够蓝"));
-        assert!(golang[0].aliases.iter().any(|alias| alias == "高粱"));
     }
 
     #[test]

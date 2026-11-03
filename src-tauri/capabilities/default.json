@@ -3,6 +3,5 @@
   "identifier": "default",
   "description": "Permissions for the main Interview Copilot window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "ios-ambient-audio:default"]
 }
-
