@@ -10,6 +10,7 @@ import type {
   AudioSourceSpeaker,
   AudioLevelEvent,
   CaptureStarted,
+  CompanionServerInfo,
   LlmStreamEvent,
   ProviderConfig,
   RuntimeInfo,
@@ -65,6 +66,13 @@ const DEFAULT_TRANSLATION_CONFIG: TranslationConfig = {
   mode: "off",
   ollamaBaseUrl: "http://127.0.0.1:11434",
   ollamaModel: "qwen2.5:3b",
+};
+
+const DEFAULT_COMPANION_INFO: CompanionServerInfo = {
+  running: false,
+  url: "",
+  port: 0,
+  localOnly: false,
 };
 
 interface SecretStatus {
@@ -249,12 +257,15 @@ function App() {
   const [answerHints, setAnswerHints] = useState("");
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
+  const askAiRef = useRef<(questionOverride?: string) => Promise<void>>(async () => undefined);
   const [status, setStatus] = useState("准备就绪");
   const [profile, setProfile] = useState("");
   const [jobDescription, setJobDescription] = useState("");
   const [sttConfig, setSttConfig] = useState(loadSttPreferences);
   const [translationConfig, setTranslationConfig] = useState(loadTranslationPreferences);
   const [showSettings, setShowSettings] = useState(false);
+  const [companionInfo, setCompanionInfo] = useState(DEFAULT_COMPANION_INFO);
+  const [companionBusy, setCompanionBusy] = useState(false);
   const [windowPreferences, setWindowPreferences] = useState(loadWindowPreferences);
   const [manualPhase, setManualPhase] = useState<ManualInterviewPhase>("question");
   const [manualAppending, setManualAppending] = useState(false);
@@ -406,6 +417,9 @@ function App() {
     const unlistenSttStatus = listen<SttStatusEvent>("stt-status", (event) => {
       setStatus(event.payload.message);
     });
+    const unlistenCompanionGenerate = listen("companion-generate-requested", () => {
+      void askAiRef.current();
+    });
 
     return () => {
       void unlistenLevel.then((fn) => fn());
@@ -414,6 +428,7 @@ function App() {
       void unlistenPartial.then((fn) => fn());
       void unlistenTranscript.then((fn) => fn());
       void unlistenSttStatus.then((fn) => fn());
+      void unlistenCompanionGenerate.then((fn) => fn());
     };
   }, []);
 
@@ -570,6 +585,13 @@ function App() {
       .catch((error) => setStatus(`窗口设置失败：${String(error)}`));
     // Window preferences are restored once. Later changes use set_window_presentation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runtimeInfo.mobile, runtimeReady]);
+
+  useEffect(() => {
+    if (!runtimeReady || runtimeInfo.mobile || !("__TAURI_INTERNALS__" in window)) return;
+    void invoke<CompanionServerInfo>("get_companion_server_info")
+      .then(setCompanionInfo)
+      .catch(() => undefined);
   }, [runtimeInfo.mobile, runtimeReady]);
 
   useEffect(() => {
@@ -740,6 +762,46 @@ function App() {
     }
   }
 
+  async function startCompanionSync() {
+    setCompanionBusy(true);
+    try {
+      const token = crypto.randomUUID().replaceAll("-", "");
+      const info = await invoke<CompanionServerInfo>("start_companion_server", { token });
+      setCompanionInfo(info);
+      setStatus(
+        info.localOnly
+          ? "同步服务已启动，但没有检测到局域网地址"
+          : "手机同步已开启，请在同一 Wi-Fi 的设备上打开链接",
+      );
+    } catch (error) {
+      setStatus(`启动手机同步失败：${String(error)}`);
+    } finally {
+      setCompanionBusy(false);
+    }
+  }
+
+  async function stopCompanionSync() {
+    setCompanionBusy(true);
+    try {
+      const info = await invoke<CompanionServerInfo>("stop_companion_server");
+      setCompanionInfo(info);
+      setStatus("手机同步已关闭");
+    } catch (error) {
+      setStatus(`关闭手机同步失败：${String(error)}`);
+    } finally {
+      setCompanionBusy(false);
+    }
+  }
+
+  async function copyCompanionUrl() {
+    try {
+      await navigator.clipboard.writeText(companionInfo.url);
+      setStatus("手机同步地址已复制");
+    } catch (error) {
+      setStatus(`复制地址失败：${String(error)}`);
+    }
+  }
+
   async function clearStoredSecret(kind: SecretKind) {
     const label = kind === "deepseekApiKey" ? "DeepSeek API Key" : "腾讯云 SecretKey";
     if (!window.confirm(`确定从系统钥匙串删除 ${label}？`)) return;
@@ -851,6 +913,10 @@ function App() {
   }
 
   async function askAi(questionOverride?: string) {
+    if (activeRequestIdRef.current) {
+      setStatus("回答正在生成，请稍候");
+      return;
+    }
     const question =
       questionOverride?.trim() ||
       currentQuestion.trim() ||
@@ -881,6 +947,8 @@ function App() {
       await startChatStream({
         requestId,
         provider,
+        question,
+        answerLanguage,
         messages: buildInterviewMessages(
           question,
           answerLanguage,
@@ -898,6 +966,8 @@ function App() {
       setStatus(`调用失败：${String(error)}`);
     }
   }
+
+  askAiRef.current = askAi;
 
   const meterWidths = {
     interviewer: `${Math.min(100, Math.max(2, audioLevels.interviewer.rms * 260))}%`,
@@ -995,6 +1065,55 @@ function App() {
               </button>
             )}
           </div>
+          {!isMobile && (
+            <div className={`companion-settings ${companionInfo.running ? "active" : ""}`}>
+              <div className="companion-heading">
+                <div>
+                  <span className="eyebrow">COMPANION OUTPUT</span>
+                  <h3>同步回答到手机</h3>
+                </div>
+                <button
+                  className={companionInfo.running ? "listen-button active" : "ask-button"}
+                  disabled={companionBusy}
+                  onClick={() =>
+                    companionInfo.running
+                      ? void stopCompanionSync()
+                      : void startCompanionSync()
+                  }
+                >
+                  {companionBusy
+                    ? "处理中…"
+                    : companionInfo.running
+                      ? "关闭同步"
+                      : "开启同步"}
+                </button>
+              </div>
+              {companionInfo.running ? (
+                <>
+                  <p className="companion-note">
+                    让 iPhone 与 Mac 连接同一个 Wi-Fi，再用 Safari 打开下面的临时地址。AI
+                    回答会逐步同步，不经过第三方转发服务。
+                  </p>
+                  <div className="companion-url-row">
+                    <code>{companionInfo.url}</code>
+                    <button className="ghost-button" onClick={() => void copyCompanionUrl()}>
+                      复制地址
+                    </button>
+                  </div>
+                  {companionInfo.localOnly && (
+                    <small className="companion-warning">
+                      当前只检测到本机地址。请确认 Mac 已连接 Wi-Fi 后重新开启同步。
+                    </small>
+                  )}
+                </>
+              ) : (
+                <p className="companion-note">
+                  默认关闭。开启后只发送当前面试问题和 AI 回答文本，不发送麦克风音频、API
+                  Key 或完整简历。
+                </p>
+              )}
+            </div>
+          )}
           <div className="settings-grid">
             <label className="wide-field">
               语音识别模式

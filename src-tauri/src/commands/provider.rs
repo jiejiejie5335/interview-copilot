@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+#[cfg(desktop)]
+use tauri::Manager;
+
+#[cfg(desktop)]
+use super::companion::CompanionRuntime;
 use super::secrets::{load_secret, SecretKind};
 
 #[derive(Debug, Deserialize)]
@@ -11,6 +16,8 @@ pub struct StreamChatRequest {
     request_id: String,
     provider: ProviderConfig,
     messages: Vec<ChatMessage>,
+    question: String,
+    answer_language: String,
     temperature: f32,
     max_tokens: u32,
 }
@@ -49,11 +56,16 @@ fn emit_stream(
     done: bool,
     error: Option<String>,
 ) {
+    let delta = delta.into();
+    #[cfg(desktop)]
+    if let Some(runtime) = app.try_state::<CompanionRuntime>() {
+        runtime.apply_stream(request_id, &delta, done, error.as_deref());
+    }
     let _ = app.emit(
         "llm-stream",
         LlmStreamEvent {
             request_id: request_id.to_owned(),
-            delta: delta.into(),
+            delta,
             done,
             error,
         },
@@ -89,8 +101,8 @@ fn data_payload(event: &[u8]) -> Result<Option<String>, String> {
 }
 
 fn content_delta(data: &str) -> Result<Option<String>, String> {
-    let value: Value = serde_json::from_str(data)
-        .map_err(|error| format!("无法解析模型流式响应：{error}"))?;
+    let value: Value =
+        serde_json::from_str(data).map_err(|error| format!("无法解析模型流式响应：{error}"))?;
 
     if let Some(error) = value.get("error") {
         let message = error
@@ -112,6 +124,15 @@ pub async fn stream_chat(app: AppHandle, mut request: StreamChatRequest) -> Resu
     if request.provider.api_key.trim().is_empty() {
         request.provider.api_key = load_secret(SecretKind::DeepseekApiKey)?
             .ok_or_else(|| "请先保存 DeepSeek API Key".to_string())?;
+    }
+
+    #[cfg(desktop)]
+    if let Some(runtime) = app.try_state::<CompanionRuntime>() {
+        runtime.begin_answer(
+            &request_id,
+            request.question.trim(),
+            request.answer_language.trim(),
+        );
     }
 
     let endpoint = format!(

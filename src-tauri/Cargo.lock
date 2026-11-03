@@ -1675,6 +1675,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "hound",
+ "libc",
  "objc2-app-kit",
  "reqwest 0.12.28",
  "security-framework",

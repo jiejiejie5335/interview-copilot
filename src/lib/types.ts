@@ -49,8 +49,17 @@ export interface StreamChatRequest {
   requestId: string;
   provider: ProviderConfig;
   messages: ChatMessage[];
+  question: string;
+  answerLanguage: AnswerLanguage;
   temperature: number;
   maxTokens: number;
+}
+
+export interface CompanionServerInfo {
+  running: boolean;
+  url: string;
+  port: number;
+  localOnly: boolean;
 }
 
 export interface LlmStreamEvent {

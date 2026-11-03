@@ -3,6 +3,10 @@ mod commands;
 pub mod stt;
 
 use commands::audio::{start_audio_capture, stop_audio_capture, AudioRuntime};
+#[cfg(desktop)]
+use commands::companion::{
+    get_companion_server_info, start_companion_server, stop_companion_server, CompanionRuntime,
+};
 use commands::provider::stream_chat;
 use commands::runtime::get_runtime_info;
 use commands::secrets::{delete_secret, get_secret_status, save_secret};
@@ -30,6 +34,7 @@ pub fn run() {
 
     #[cfg(desktop)]
     let builder = builder
+        .manage(CompanionRuntime::default())
         .manage(WindowRuntime::default())
         .on_window_event(enforce_locked_position)
         .invoke_handler(tauri::generate_handler![
@@ -41,6 +46,9 @@ pub fn run() {
             save_secret,
             delete_secret,
             translate_text,
+            start_companion_server,
+            stop_companion_server,
+            get_companion_server_info,
             restore_window_preferences,
             set_window_presentation
         ]);
