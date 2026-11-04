@@ -3,7 +3,8 @@
 本地优先的 macOS / iPhone 技术面试练习与经授权实时辅助工具。当前阶段聚焦：
 
 - Tauri 2 + React 桌面壳
-- macOS 系统音频与麦克风双通道采集（原生 Swift helper）
+- macOS 系统音频与麦克风双通道采集（Core Audio Tap + 主进程麦克风）
+- Zoom/蓝牙设备切换容错：双通道独立运行，单路中断会自动退避重连
 - 中文、英文及中英混合问题检测
 - DeepSeek / OpenAI-compatible 流式回答
 - 可关闭的英文转中文翻译：DeepSeek 云端或 Ollama 本地

@@ -21,7 +21,7 @@ pub use sherpa::{
     refine_samples, refine_samples_with_model, run_streaming_worker, transcribe_samples,
     validate_installation, validate_local_installation,
 };
-pub use tencent::{run_tencent_streaming_worker, TencentAsrConfig};
+pub use tencent::{run_tencent_streaming_worker, TencentAsrConfig, TencentStreamEnd};
 
 #[cfg(not(target_os = "macos"))]
 pub fn validate_local_installation(_model: RefinementModel) -> anyhow::Result<()> {

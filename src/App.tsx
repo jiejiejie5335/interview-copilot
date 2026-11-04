@@ -9,6 +9,7 @@ import type {
   AnswerLanguage,
   AudioSourceSpeaker,
   AudioLevelEvent,
+  AudioSourceStatusEvent,
   CaptureStarted,
   CompanionServerInfo,
   LlmStreamEvent,
@@ -340,6 +341,12 @@ function App() {
       setStatus(`音频错误：${event.payload}`);
       void invoke("stop_audio_capture").catch(() => undefined);
     });
+    const unlistenAudioSourceStatus = listen<AudioSourceStatusEvent>(
+      "audio-source-status",
+      (event) => {
+        setStatus(event.payload.message);
+      },
+    );
     const unlistenPartial = listen<TranscriptPartialEvent>("transcript-partial", (event) => {
       const payload = event.payload;
       if (deletedTranscriptIdsRef.current.has(payload.id)) return;
@@ -425,6 +432,7 @@ function App() {
       void unlistenLevel.then((fn) => fn());
       void unlistenLlm.then((fn) => fn());
       void unlistenAudioError.then((fn) => fn());
+      void unlistenAudioSourceStatus.then((fn) => fn());
       void unlistenPartial.then((fn) => fn());
       void unlistenTranscript.then((fn) => fn());
       void unlistenSttStatus.then((fn) => fn());

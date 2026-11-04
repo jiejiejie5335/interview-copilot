@@ -31,6 +31,12 @@ pub struct TencentAsrConfig {
     pub secret_key: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TencentStreamEnd {
+    SessionComplete,
+    InputClosed,
+}
+
 impl TencentAsrConfig {
     pub fn validate(&self) -> Result<()> {
         if self.app_id.trim().is_empty()
@@ -264,11 +270,11 @@ fn samples_to_pcm(samples: &[f32]) -> Vec<u8> {
 
 pub async fn run_tencent_streaming_worker(
     app: AppHandle,
-    mut receiver: mpsc::Receiver<AudioChunk>,
-    config: TencentAsrConfig,
-    hotwords: String,
+    receiver: &mut mpsc::Receiver<AudioChunk>,
+    config: &TencentAsrConfig,
+    hotwords: &str,
     speaker: &'static str,
-) -> Result<()> {
+) -> Result<TencentStreamEnd> {
     let speaker_label = if speaker == "interviewer" {
         "面试官"
     } else {
@@ -283,7 +289,7 @@ pub async fn run_tencent_streaming_worker(
     let timestamp = unix_seconds()?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.subsec_nanos() as u64;
     let voice_id = format!("interview-{speaker}-{timestamp}-{nonce}");
-    let url = build_signed_url(&config, &hotwords, timestamp, nonce, &voice_id)?;
+    let url = build_signed_url(config, hotwords, timestamp, nonce, &voice_id)?;
     let (mut websocket, _) = connect_async(url)
         .await
         .context("无法连接腾讯云 ASR WebSocket")?;
@@ -323,8 +329,8 @@ pub async fn run_tencent_streaming_worker(
                 match message? {
                     Message::Text(text) => {
                         let value: Value = serde_json::from_str(text.as_ref())?;
-                        if handle_response(&app, &value, &hotwords, &voice_id, speaker)? {
-                            return Ok(());
+                        if handle_response(&app, &value, hotwords, &voice_id, speaker)? {
+                            return Ok(TencentStreamEnd::SessionComplete);
                         }
                     }
                     Message::Ping(data) => websocket.send(Message::Pong(data)).await?,
@@ -353,7 +359,7 @@ pub async fn run_tencent_streaming_worker(
         match message? {
             Message::Text(text) => {
                 let value: Value = serde_json::from_str(text.as_ref())?;
-                if handle_response(&app, &value, &hotwords, &voice_id, speaker)? {
+                if handle_response(&app, &value, hotwords, &voice_id, speaker)? {
                     break;
                 }
             }
@@ -363,7 +369,7 @@ pub async fn run_tencent_streaming_worker(
         }
     }
     emit_status(&app, "listening", "腾讯云 ASR 已完成当前音频流");
-    Ok(())
+    Ok(TencentStreamEnd::InputClosed)
 }
 
 #[cfg(test)]

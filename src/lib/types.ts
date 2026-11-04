@@ -76,6 +76,13 @@ export interface AudioLevelEvent {
   speaker: AudioSourceSpeaker;
 }
 
+export interface AudioSourceStatusEvent {
+  speaker: AudioSourceSpeaker;
+  state: "connecting" | "listening" | "recovering";
+  message: string;
+  retryDelayMs?: number;
+}
+
 export interface TranscriptFinalEvent {
   id: string;
   text: string;

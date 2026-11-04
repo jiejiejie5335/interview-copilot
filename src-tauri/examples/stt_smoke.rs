@@ -40,11 +40,15 @@ async fn main() -> anyhow::Result<()> {
 
     let capture = tokio::spawn(async move {
         let mut segmenter = SpeechSegmenter::default();
-        run_pcm_stream(capture_stop, move |samples, sample_rate| {
-            for segment in segmenter.push(samples, sample_rate) {
-                let _ = sender.try_send(segment);
-            }
-        })
+        run_pcm_stream(
+            capture_stop,
+            move |samples, sample_rate| {
+                for segment in segmenter.push(samples, sample_rate) {
+                    let _ = sender.try_send(segment);
+                }
+            },
+            |_| {},
+        )
         .await
     });
 

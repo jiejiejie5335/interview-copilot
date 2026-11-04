@@ -5,7 +5,6 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
-import AVFoundation
 
 enum TapError: Error, CustomStringConvertible {
     case status(String, OSStatus)
@@ -68,9 +67,22 @@ private func tapFormat(_ tap: AudioObjectID) throws -> AudioStreamBasicDescripti
 final class SystemAudioTap {
     private var tapID = AudioObjectID(kAudioObjectUnknown)
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
+    private var outputDeviceID = AudioObjectID(kAudioObjectUnknown)
     private var ioProcID: AudioDeviceIOProcID?
     private let queue = DispatchQueue(label: "com.interviewcopilot.audio-tap", qos: .userInitiated)
     private let writerQueue = DispatchQueue(label: "com.interviewcopilot.audio-writer", qos: .userInitiated)
+    private var defaultOutputAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+    private var outputSampleRateAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    private var listeningForSampleRate = false
     private var sampleRate: Double = 48_000
 
     func start() throws {
@@ -79,6 +91,7 @@ final class SystemAudioTap {
         }
 
         let output = try defaultOutputDevice()
+        outputDeviceID = output
         let outputUID = try deviceUID(output)
         let tapDescription = CATapDescription(monoGlobalTapButExcludeProcesses: [])
         tapDescription.uuid = UUID()
@@ -125,15 +138,57 @@ final class SystemAudioTap {
         let header = "{\"sampleRate\":\(Int(sampleRate)),\"channels\":1,\"format\":\"f32le\"}\n"
         outputHandle.write(Data(header.utf8))
         try checked("start aggregate device", AudioDeviceStart(aggregateID, ioProcID))
+
+        let listener: AudioObjectPropertyListenerBlock = { _, _ in
+            FileHandle.standardError.write(Data(
+                "输出设备或采样率已切换，需要重新建立系统音频捕获\n".utf8
+            ))
+            exit(75)
+        }
+        try checked("listen for default output changes", AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &defaultOutputAddress,
+            queue,
+            listener
+        ))
+        if AudioObjectHasProperty(outputDeviceID, &outputSampleRateAddress) {
+            try checked("listen for output sample-rate changes", AudioObjectAddPropertyListenerBlock(
+                outputDeviceID,
+                &outputSampleRateAddress,
+                queue,
+                listener
+            ))
+            listeningForSampleRate = true
+        }
+        defaultOutputListener = listener
     }
 
     func stop() {
+        if let defaultOutputListener {
+            _ = AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &defaultOutputAddress,
+                queue,
+                defaultOutputListener
+            )
+            if listeningForSampleRate, outputDeviceID != kAudioObjectUnknown {
+                _ = AudioObjectRemovePropertyListenerBlock(
+                    outputDeviceID,
+                    &outputSampleRateAddress,
+                    queue,
+                    defaultOutputListener
+                )
+                listeningForSampleRate = false
+            }
+            self.defaultOutputListener = nil
+        }
         if aggregateID != kAudioObjectUnknown {
             _ = AudioDeviceStop(aggregateID, ioProcID)
             if let ioProcID { _ = AudioDeviceDestroyIOProcID(aggregateID, ioProcID) }
             _ = AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = AudioObjectID(kAudioObjectUnknown)
         }
+        outputDeviceID = AudioObjectID(kAudioObjectUnknown)
         if tapID != kAudioObjectUnknown {
             _ = AudioHardwareDestroyProcessTap(tapID)
             tapID = AudioObjectID(kAudioObjectUnknown)
@@ -143,113 +198,16 @@ final class SystemAudioTap {
     deinit { stop() }
 }
 
-final class MicrophoneCapture {
-    private let engine = AVAudioEngine()
-    private let writerQueue = DispatchQueue(
-        label: "com.interviewcopilot.microphone-writer",
-        qos: .userInitiated
-    )
-    private var tapInstalled = false
-
-    private func requestPermission() throws {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            return
-        case .denied, .restricted:
-            throw TapError.message("麦克风权限未开启，请到 系统设置 → 隐私与安全性 → 麦克风 中允许 Interview Copilot")
-        case .notDetermined:
-            let semaphore = DispatchSemaphore(value: 0)
-            var granted = false
-            AVCaptureDevice.requestAccess(for: .audio) { allowed in
-                granted = allowed
-                semaphore.signal()
-            }
-            semaphore.wait()
-            if !granted {
-                throw TapError.message("未获得麦克风权限")
-            }
-        @unknown default:
-            throw TapError.message("无法确认麦克风权限状态")
-        }
-    }
-
-    func start() throws {
-        try requestPermission()
-
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw TapError.message("默认麦克风没有可用的输入格式")
-        }
-
-        let outputHandle = FileHandle.standardOutput
-        let channelCount = Int(format.channelCount)
-        input.installTap(onBus: 0, bufferSize: 2_048, format: format) {
-            [writerQueue] buffer, _ in
-            guard let channels = buffer.floatChannelData else { return }
-            let frameCount = Int(buffer.frameLength)
-            guard frameCount > 0 else { return }
-
-            var mono = [Float](repeating: 0, count: frameCount)
-            for channel in 0..<channelCount {
-                let samples = channels[channel]
-                for frame in 0..<frameCount {
-                    mono[frame] += samples[frame]
-                }
-            }
-            if channelCount > 1 {
-                let scale = 1.0 / Float(channelCount)
-                for frame in 0..<frameCount {
-                    mono[frame] *= scale
-                }
-            }
-
-            writerQueue.async {
-                mono.withUnsafeBytes { bytes in
-                    outputHandle.write(Data(bytes))
-                }
-            }
-        }
-        tapInstalled = true
-
-        let header = "{\"sampleRate\":\(Int(format.sampleRate)),\"channels\":1,\"format\":\"f32le\"}\n"
-        outputHandle.write(Data(header.utf8))
-        engine.prepare()
-        try engine.start()
-    }
-
-    func stop() {
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-        }
-        engine.stop()
-    }
-
-    deinit { stop() }
-}
-
 @main
 enum AudioTapMain {
     static func main() {
-        if CommandLine.arguments.dropFirst().first == "microphone" {
-            let microphone = MicrophoneCapture()
-            do {
-                try microphone.start()
-                dispatchMain()
-            } catch {
-                FileHandle.standardError.write(Data("\(error)\n".utf8))
-                exit(1)
-            }
-        } else {
-            let tap = SystemAudioTap()
-            do {
-                try tap.start()
-                dispatchMain()
-            } catch {
-                FileHandle.standardError.write(Data("\(error)\n".utf8))
-                exit(1)
-            }
+        let tap = SystemAudioTap()
+        do {
+            try tap.start()
+            dispatchMain()
+        } catch {
+            FileHandle.standardError.write(Data("\(error)\n".utf8))
+            exit(1)
         }
     }
 }

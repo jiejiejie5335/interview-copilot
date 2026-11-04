@@ -8,8 +8,9 @@ use std::sync::OnceLock;
 
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
+use tokio::time::{self, Duration, Instant};
 
-use crate::stt::{AudioChunk, RefinementModel, TencentAsrConfig};
+use crate::stt::{AudioChunk, RefinementModel, TencentAsrConfig, TencentStreamEnd};
 
 use super::secrets::{load_secret, SecretKind};
 
@@ -53,6 +54,15 @@ struct AudioLevelEvent {
     peak: f32,
     sample_rate: u32,
     speaker: &'static str,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioSourceStatusEvent {
+    speaker: &'static str,
+    state: &'static str,
+    message: String,
+    retry_delay_ms: Option<u64>,
 }
 
 #[derive(serde::Serialize)]
@@ -146,22 +156,62 @@ fn spawn_stt_worker(
         }
         SttMode::TencentCloud => {
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = crate::stt::run_tencent_streaming_worker(
-                    app.clone(),
-                    receiver,
-                    config.tencent,
-                    config.hotwords,
-                    speaker,
-                )
-                .await
-                {
-                    let source = if speaker == "interviewer" {
-                        "系统音频"
-                    } else {
-                        "麦克风"
-                    };
-                    let _ = app.emit("audio-error", format!("{source}识别失败：{error}"));
-                    stop.store(true, Ordering::Release);
+                let source = match speaker {
+                    "interviewer" => "系统音频",
+                    "candidate" => "麦克风",
+                    _ => "环境音频",
+                };
+                let mut receiver = receiver;
+                let mut failure_count = 0_u32;
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let started_at = Instant::now();
+                    match crate::stt::run_tencent_streaming_worker(
+                        app.clone(),
+                        &mut receiver,
+                        &config.tencent,
+                        &config.hotwords,
+                        speaker,
+                    )
+                    .await
+                    {
+                        Ok(TencentStreamEnd::InputClosed) => return,
+                        Ok(TencentStreamEnd::SessionComplete) => {
+                            failure_count = 0;
+                            emit_audio_source_status(
+                                &app,
+                                speaker,
+                                "connecting",
+                                format!("正在续接{source}腾讯云识别会话…"),
+                                Some(Duration::from_millis(150)),
+                            );
+                            if !wait_for_retry(&stop, Duration::from_millis(150)).await {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            if started_at.elapsed() >= Duration::from_secs(20) {
+                                failure_count = 0;
+                            }
+                            let delay = capture_retry_delay(failure_count);
+                            failure_count = failure_count.saturating_add(1);
+                            emit_audio_source_status(
+                                &app,
+                                speaker,
+                                "recovering",
+                                format!(
+                                    "{source}识别连接中断，{:.1} 秒后自动重连；音频采集继续。{error}",
+                                    delay.as_secs_f32()
+                                ),
+                                Some(delay),
+                            );
+                            if !wait_for_retry(&stop, delay).await {
+                                return;
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -203,6 +253,132 @@ fn audio_handler(
             samples: samples.to_vec(),
             sample_rate,
         });
+    }
+}
+
+fn emit_audio_source_status(
+    app: &AppHandle,
+    speaker: &'static str,
+    state: &'static str,
+    message: impl Into<String>,
+    retry_delay: Option<Duration>,
+) {
+    let message = message.into();
+    if state == "recovering" {
+        eprintln!("[audio:{speaker}] {message}");
+    }
+    let _ = app.emit(
+        "audio-source-status",
+        AudioSourceStatusEvent {
+            speaker,
+            state,
+            message,
+            retry_delay_ms: retry_delay.map(|delay| delay.as_millis() as u64),
+        },
+    );
+}
+
+fn capture_retry_delay(failure_count: u32) -> Duration {
+    Duration::from_millis(500_u64.saturating_mul(1_u64 << failure_count.min(4)))
+}
+
+async fn wait_for_retry(stop: &AtomicBool, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        time::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+    !stop.load(Ordering::Acquire)
+}
+
+#[cfg(target_os = "macos")]
+async fn supervise_macos_capture(
+    app: AppHandle,
+    sender: mpsc::Sender<AudioChunk>,
+    speaker: &'static str,
+    source: &'static str,
+    microphone: bool,
+    stop: Arc<AtomicBool>,
+) {
+    let mut failure_count = 0_u32;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+
+        let recovering = failure_count > 0;
+        emit_audio_source_status(
+            &app,
+            speaker,
+            "connecting",
+            if recovering {
+                format!("正在重新连接{source}…")
+            } else {
+                format!("正在连接{source}…")
+            },
+            None,
+        );
+        let started_at = Instant::now();
+        let ready_app = app.clone();
+        let on_ready = move |sample_rate| {
+            emit_audio_source_status(
+                &ready_app,
+                speaker,
+                "listening",
+                if recovering {
+                    format!("{source}已恢复监听（{sample_rate} Hz）")
+                } else {
+                    format!("{source}已连接（{sample_rate} Hz）")
+                },
+                None,
+            );
+        };
+        let result = if microphone {
+            crate::audio::macos::run_microphone_pcm_stream(
+                stop.clone(),
+                audio_handler(app.clone(), sender.clone(), speaker),
+                on_ready,
+            )
+            .await
+        } else {
+            crate::audio::macos::run_pcm_stream(
+                stop.clone(),
+                audio_handler(app.clone(), sender.clone(), speaker),
+                on_ready,
+            )
+            .await
+        };
+
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        if started_at.elapsed() >= Duration::from_secs(20) {
+            failure_count = 0;
+        }
+        let delay = capture_retry_delay(failure_count);
+        failure_count = failure_count.saturating_add(1);
+        let detail = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "音频流意外结束".to_string());
+        emit_audio_source_status(
+            &app,
+            speaker,
+            "recovering",
+            format!(
+                "{source}暂时中断，{:.1} 秒后自动重连；另一通道继续监听。{detail}",
+                delay.as_secs_f32()
+            ),
+            Some(delay),
+        );
+        if !wait_for_retry(&stop, delay).await {
+            return;
+        }
     }
 }
 
@@ -271,34 +447,23 @@ pub async fn start_audio_capture(
                 stop.clone(),
             );
 
-            let system_capture = crate::audio::macos::run_pcm_stream(
+            let system_capture = supervise_macos_capture(
+                app_handle.clone(),
+                system_sender,
+                "interviewer",
+                "系统音频",
+                false,
                 stop.clone(),
-                audio_handler(app_handle.clone(), system_sender, "interviewer"),
             );
-            let microphone_capture = crate::audio::macos::run_microphone_pcm_stream(
+            let microphone_capture = supervise_macos_capture(
+                app_handle,
+                microphone_sender,
+                "candidate",
+                "麦克风",
+                true,
                 stop.clone(),
-                audio_handler(app_handle.clone(), microphone_sender, "candidate"),
             );
-            tokio::pin!(system_capture, microphone_capture);
-
-            let (first_source, first_result, second_source, second_result) = tokio::select! {
-                result = &mut system_capture => {
-                    stop.store(true, Ordering::Release);
-                    let microphone_result = (&mut microphone_capture).await;
-                    ("系统音频", result, "麦克风", microphone_result)
-                }
-                result = &mut microphone_capture => {
-                    stop.store(true, Ordering::Release);
-                    let system_result = (&mut system_capture).await;
-                    ("麦克风", result, "系统音频", system_result)
-                }
-            };
-
-            for (source, result) in [(first_source, first_result), (second_source, second_result)] {
-                if let Err(error) = result {
-                    let _ = app.emit("audio-error", format!("{source}采集失败：{error}"));
-                }
-            }
+            tokio::join!(system_capture, microphone_capture);
             running.store(false, Ordering::Release);
         });
         Ok(CaptureStarted {
@@ -328,6 +493,20 @@ pub async fn start_audio_capture(
         Ok(CaptureStarted {
             audio_capture: "ambient",
         })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::capture_retry_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn capture_retry_uses_bounded_exponential_backoff() {
+        assert_eq!(capture_retry_delay(0), Duration::from_millis(500));
+        assert_eq!(capture_retry_delay(1), Duration::from_secs(1));
+        assert_eq!(capture_retry_delay(4), Duration::from_secs(8));
+        assert_eq!(capture_retry_delay(12), Duration::from_secs(8));
     }
 }
 
