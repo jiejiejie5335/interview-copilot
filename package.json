@@ -9,10 +9,12 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "setup:stt": "node scripts/setup-stt.mjs",
-    "tauri": "node scripts/run-tauri.mjs"
+    "tauri": "node scripts/run-tauri.mjs",
+    "build:mac": "node scripts/build-mac.mjs",
+    "start:mac": "node scripts/start-mac.mjs"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/api": "^2.12.4",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },

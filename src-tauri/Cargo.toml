@@ -5,7 +5,7 @@ description = "A bilingual interview practice copilot"
 authors = ["Interview Copilot contributors"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 
 [lib]
 name = "interview_copilot_lib"
@@ -38,3 +38,4 @@ cpal = "0.18.2"
 libc = "0.2"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWindow"] }
 sherpa-onnx = { version = "1.13.5", default-features = false, features = ["static"] }
+tauri-plugin-global-shortcut = "2"

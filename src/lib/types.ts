@@ -62,6 +62,13 @@ export interface CompanionServerInfo {
   localOnly: boolean;
 }
 
+export interface GlobalShortcutStatus {
+  accelerator: string;
+  label: string;
+  registered: boolean;
+  error?: string;
+}
+
 export interface LlmStreamEvent {
   requestId: string;
   delta: string;

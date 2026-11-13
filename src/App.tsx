@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { buildLiveInterviewerTranscript } from "./lib/companion";
 import { detectQuestion } from "./lib/questionDetector";
 import { startChatStream } from "./lib/provider";
 import { buildInterviewMessages } from "./lib/prompts";
@@ -12,6 +13,7 @@ import type {
   AudioSourceStatusEvent,
   CaptureStarted,
   CompanionServerInfo,
+  GlobalShortcutStatus,
   LlmStreamEvent,
   ProviderConfig,
   RuntimeInfo,
@@ -74,6 +76,12 @@ const DEFAULT_COMPANION_INFO: CompanionServerInfo = {
   url: "",
   port: 0,
   localOnly: false,
+};
+
+const DEFAULT_GLOBAL_SHORTCUT_STATUS: GlobalShortcutStatus = {
+  accelerator: "CommandOrControl+Shift+Enter",
+  label: "⌘ + Shift + Enter",
+  registered: false,
 };
 
 interface SecretStatus {
@@ -259,6 +267,7 @@ function App() {
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const activeRequestIdRef = useRef<string | null>(null);
   const askAiRef = useRef<(questionOverride?: string) => Promise<void>>(async () => undefined);
+  const liveInterviewerTranscriptRef = useRef("");
   const [status, setStatus] = useState("准备就绪");
   const [profile, setProfile] = useState("");
   const [jobDescription, setJobDescription] = useState("");
@@ -267,6 +276,10 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [companionInfo, setCompanionInfo] = useState(DEFAULT_COMPANION_INFO);
   const [companionBusy, setCompanionBusy] = useState(false);
+  const [globalShortcutStatus, setGlobalShortcutStatus] = useState(
+    DEFAULT_GLOBAL_SHORTCUT_STATUS,
+  );
+  const globalShortcutTriggeredAtRef = useRef(0);
   const [windowPreferences, setWindowPreferences] = useState(loadWindowPreferences);
   const [manualPhase, setManualPhase] = useState<ManualInterviewPhase>("question");
   const [manualAppending, setManualAppending] = useState(false);
@@ -287,6 +300,10 @@ function App() {
     [partialTranscripts],
   );
   const interviewerPartial = partialTranscripts.interviewer;
+  const liveInterviewerTranscript = useMemo(
+    () => buildLiveInterviewerTranscript(transcript, interviewerPartial),
+    [interviewerPartial, transcript],
+  );
   const detection = useMemo(
     () =>
       detectQuestion(
@@ -314,6 +331,17 @@ function App() {
   useEffect(() => {
     partialTranscriptsRef.current = partialTranscripts;
   }, [partialTranscripts]);
+
+  useEffect(() => {
+    liveInterviewerTranscriptRef.current = liveInterviewerTranscript;
+    if (isMobile || !companionInfo.running) return;
+    const timer = window.setTimeout(() => {
+      void invoke("update_companion_transcript", {
+        text: liveInterviewerTranscript,
+      }).catch(() => undefined);
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [companionInfo.running, isMobile, liveInterviewerTranscript]);
 
   useEffect(() => {
     const unlistenLevel = listen<AudioLevelEvent>("audio-level", (event) => {
@@ -425,7 +453,18 @@ function App() {
       setStatus(event.payload.message);
     });
     const unlistenCompanionGenerate = listen("companion-generate-requested", () => {
-      void askAiRef.current();
+      void askAiRef.current(liveInterviewerTranscriptRef.current || undefined);
+    });
+    const unlistenGlobalAnswerShortcut = listen("global-answer-shortcut", () => {
+      const now = Date.now();
+      if (now - globalShortcutTriggeredAtRef.current < 700) return;
+      globalShortcutTriggeredAtRef.current = now;
+      if (activeRequestIdRef.current) {
+        setStatus("回答正在生成，已忽略重复快捷键");
+        return;
+      }
+      setStatus("已通过全局快捷键请求生成建议");
+      void askAiRef.current(liveInterviewerTranscriptRef.current || undefined);
     });
 
     return () => {
@@ -437,8 +476,21 @@ function App() {
       void unlistenTranscript.then((fn) => fn());
       void unlistenSttStatus.then((fn) => fn());
       void unlistenCompanionGenerate.then((fn) => fn());
+      void unlistenGlobalAnswerShortcut.then((fn) => fn());
     };
   }, []);
+
+  useEffect(() => {
+    if (!runtimeReady || isMobile) return;
+    void invoke<GlobalShortcutStatus>("get_global_shortcut_status")
+      .then(setGlobalShortcutStatus)
+      .catch((error) =>
+        setGlobalShortcutStatus({
+          ...DEFAULT_GLOBAL_SHORTCUT_STATUS,
+          error: String(error),
+        }),
+      );
+  }, [isMobile, runtimeReady]);
 
   useEffect(() => {
     const mobilePreview = new URLSearchParams(window.location.search).has("mobilePreview");
@@ -1540,13 +1592,27 @@ function App() {
               <span className="eyebrow">ANSWER COACH</span>
               <h2>回答建议</h2>
             </div>
-            <button
-              className="ask-button"
-              disabled={Boolean(activeRequestId)}
-              onClick={() => void askAi()}
-            >
-              {activeRequestId ? "生成中…" : "生成建议"}
-            </button>
+            <div className="answer-actions">
+              {!isMobile && (
+                <small
+                  className={`shortcut-status ${
+                    globalShortcutStatus.registered ? "ready" : "error"
+                  }`}
+                  title={globalShortcutStatus.error}
+                >
+                  {globalShortcutStatus.registered
+                    ? `全局快捷键 ${globalShortcutStatus.label}`
+                    : globalShortcutStatus.error || "正在注册全局快捷键…"}
+                </small>
+              )}
+              <button
+                className="ask-button"
+                disabled={Boolean(activeRequestId)}
+                onClick={() => void askAi()}
+              >
+                {activeRequestId ? "生成中…" : "生成建议"}
+              </button>
+            </div>
           </div>
 
           <div className="detection-card">

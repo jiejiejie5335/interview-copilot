@@ -23,6 +23,7 @@ type GenerateCallback = Arc<dyn Fn() + Send + Sync>;
 #[serde(rename_all = "camelCase")]
 struct CompanionSnapshot {
     request_id: String,
+    live_transcript: String,
     question: String,
     answer: String,
     answer_language: String,
@@ -138,8 +139,10 @@ impl CompanionRuntime {
 
     pub fn begin_answer(&self, request_id: &str, question: &str, answer_language: &str) {
         self.update_snapshot(|snapshot| {
+            let live_transcript = snapshot.live_transcript.clone();
             *snapshot = CompanionSnapshot {
                 request_id: request_id.to_string(),
+                live_transcript,
                 question: question.to_string(),
                 answer: String::new(),
                 answer_language: answer_language.to_string(),
@@ -147,6 +150,13 @@ impl CompanionRuntime {
                 done: false,
                 updated_at: unix_timestamp(),
             };
+        });
+    }
+
+    pub fn update_live_transcript(&self, text: &str) {
+        self.update_snapshot(|snapshot| {
+            snapshot.live_transcript = text.to_string();
+            snapshot.updated_at = unix_timestamp();
         });
     }
 
@@ -231,6 +241,11 @@ pub fn get_companion_server_info(
     runtime: State<'_, CompanionRuntime>,
 ) -> Result<CompanionServerInfo, String> {
     runtime.info()
+}
+
+#[tauri::command]
+pub fn update_companion_transcript(runtime: State<'_, CompanionRuntime>, text: String) {
+    runtime.update_live_transcript(text.trim());
 }
 
 async fn handle_connection(
@@ -477,8 +492,9 @@ const COMPANION_PAGE: &str = r#"<!doctype html>
     #state { color:#75dcb5; font-size:12px; }
     section { margin-bottom:14px; padding:16px; border:1px solid #24303b; border-radius:15px; background:rgba(15,21,28,.94); }
     label { display:block; margin-bottom:8px; color:#788797; font-size:11px; font-weight:700; letter-spacing:.08em; }
+    #live-transcript { color:#edf4fa; font-size:16px; line-height:1.7; white-space:pre-wrap; }
     #question { color:#aebbc7; font-size:14px; line-height:1.65; white-space:pre-wrap; }
-    #answer { min-height:45dvh; color:#f1f6fa; font-size:18px; line-height:1.8; white-space:pre-wrap; }
+    #answer { min-height:35dvh; color:#f1f6fa; font-size:18px; line-height:1.8; white-space:pre-wrap; }
     .empty { color:#667381 !important; }
     #generate { position:fixed; z-index:10; right:max(18px,env(safe-area-inset-right)); bottom:max(14px,env(safe-area-inset-bottom)); left:max(18px,env(safe-area-inset-left)); min-height:58px; border:1px solid #51d5a3; border-radius:16px; color:#06120e; background:#6ce1b4; box-shadow:0 12px 32px rgba(0,0,0,.38); font:700 17px/1 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif; }
     #generate:active { transform:translateY(1px); }
@@ -488,13 +504,15 @@ const COMPANION_PAGE: &str = r#"<!doctype html>
 </head>
 <body>
   <header><h1>Interview Copilot</h1><span id="state">正在连接…</span></header>
-  <section><label>面试问题</label><div id="question" class="empty">等待 Mac 发送问题</div></section>
+  <section><label>面试官实时转写</label><div id="live-transcript" class="empty">等待面试官说话</div></section>
+  <section><label>本次生成所用问题</label><div id="question" class="empty">点击生成建议后固定问题</div></section>
   <section><label>AI 回答建议</label><div id="answer" class="empty">等待生成回答</div></section>
   <footer>局域网临时会话 · 关闭 Mac 同步后立即失效</footer>
   <button id="generate" type="button">生成建议</button>
   <script>
     const token = location.pathname.split('/').filter(Boolean)[0] || '';
     const state = document.querySelector('#state');
+    const liveTranscript = document.querySelector('#live-transcript');
     const question = document.querySelector('#question');
     const answer = document.querySelector('#answer');
     const generate = document.querySelector('#generate');
@@ -536,8 +554,10 @@ const COMPANION_PAGE: &str = r#"<!doctype html>
     source.addEventListener('error', () => { state.textContent = '正在重连…'; });
     source.addEventListener('answer', (event) => {
       const data = JSON.parse(event.data);
-      question.textContent = data.question || '等待 Mac 发送问题';
+      liveTranscript.textContent = data.liveTranscript || '等待面试官说话';
+      question.textContent = data.question || '点击生成建议后固定问题';
       answer.textContent = data.answer || (data.status || '等待生成回答');
+      liveTranscript.classList.toggle('empty', !data.liveTranscript);
       question.classList.toggle('empty', !data.question);
       answer.classList.toggle('empty', !data.answer);
       state.textContent = data.status || '已连接';
@@ -554,7 +574,9 @@ const COMPANION_PAGE: &str = r#"<!doctype html>
 
 #[cfg(test)]
 mod tests {
-    use super::{preferred_lan_ipv4, validate_token, CompanionRuntime, GenerateCallback};
+    use super::{
+        preferred_lan_ipv4, validate_token, CompanionRuntime, GenerateCallback, COMPANION_PAGE,
+    };
     use futures_util::StreamExt;
     use std::{
         net::Ipv4Addr,
@@ -587,6 +609,13 @@ mod tests {
             preferred_lan_ipv4(&candidates),
             Some(Ipv4Addr::new(192, 168, 0, 216))
         );
+    }
+
+    #[test]
+    fn companion_page_has_separate_live_and_fixed_question_sections() {
+        assert!(COMPANION_PAGE.contains("面试官实时转写"));
+        assert!(COMPANION_PAGE.contains("本次生成所用问题"));
+        assert!(COMPANION_PAGE.contains("data.liveTranscript"));
     }
 
     #[tokio::test]
@@ -623,6 +652,7 @@ mod tests {
         assert_eq!(control_response.status(), reqwest::StatusCode::ACCEPTED);
         assert_eq!(generate_count.load(Ordering::SeqCst), 1);
 
+        runtime.update_live_transcript("请介绍一下你的项目");
         runtime.begin_answer("request-1", "请介绍一下项目", "zh");
         runtime.apply_stream("request-1", "这是回答。", true, None);
         let response = client
@@ -637,6 +667,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let event = String::from_utf8_lossy(&chunk);
+        assert!(event.contains("请介绍一下你的项目"));
         assert!(event.contains("请介绍一下项目"));
         assert!(event.contains("这是回答。"));
 

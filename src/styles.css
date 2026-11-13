@@ -443,6 +443,29 @@ textarea {
   opacity: 0.58;
 }
 
+.answer-actions {
+  display: flex;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.shortcut-status {
+  color: #718092;
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+.shortcut-status.ready {
+  color: #75dcb5;
+}
+
+.shortcut-status.error {
+  max-width: 260px;
+  color: #ff9a9a;
+  text-align: right;
+}
+
 .audio-sources {
   display: grid;
   flex: 0 0 auto;
